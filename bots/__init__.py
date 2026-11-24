@@ -1,0 +1,1 @@
+from .thaiticketmajor import ThaiTicketMajorBot
