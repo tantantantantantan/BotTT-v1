@@ -24,6 +24,7 @@ from bots.thaiticketmajor import ThaiTicketMajorBot
 
 class UiSignals(QObject):
     log = Signal(str)
+    progress = Signal(str)
     finished = Signal()
     failed = Signal(str)
 
@@ -40,6 +41,7 @@ class MainWindow(QMainWindow):
 
         self.signals = UiSignals()
         self.signals.log.connect(self.append_log)
+        self.signals.progress.connect(self.set_progress)
         self.signals.finished.connect(self.on_finished)
         self.signals.failed.connect(self.on_failed)
 
@@ -300,6 +302,14 @@ class MainWindow(QMainWindow):
 
         log_layout.addLayout(log_header)
 
+        # Live line for countdowns / queue progress: updated in place,
+        # so the log below only collects real events.
+        self.progress_label = QLabel("")
+        self.progress_label.setObjectName("live")
+        self.progress_label.setWordWrap(True)
+        self.progress_label.setVisible(False)
+        log_layout.addWidget(self.progress_label)
+
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMinimumHeight(150)
@@ -477,6 +487,15 @@ class MainWindow(QMainWindow):
                 color: #e2e8f0;
                 border: 1px solid #3b82f6;
             }
+            QLabel#live {
+                background: #10223f;
+                color: #bfdbfe;
+                border: 1px solid #1e3a66;
+                border-radius: 9px;
+                padding: 8px 12px;
+                font-size: 14px;
+                font-weight: 700;
+            }
             QPlainTextEdit#log {
                 background: #070d1a;
                 color: #d7f3ff;
@@ -554,11 +573,13 @@ class MainWindow(QMainWindow):
             show_round=self.show_round.text().strip() or "AUTO",
             prelogin_minutes=60,
             status_callback=self.thread_log,
+            progress_callback=self.thread_progress,
             stop_callback=self.should_stop,
         )
 
         self.stop_requested = False
         self.log_box.clear()
+        self.set_progress("")
 
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -609,10 +630,24 @@ class MainWindow(QMainWindow):
     def thread_log(self, message):
         self.signals.log.emit(str(message))
 
+    def thread_progress(self, message):
+        self.signals.progress.emit(str(message))
+
+    def set_progress(self, message):
+        message = str(message or "").strip()
+        self.progress_label.setText(message)
+        self.progress_label.setVisible(bool(message))
+
     def append_log(self, message):
-        self.log_box.appendPlainText(str(message))
         bar = self.log_box.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        # Follow new lines only if the user is already at the bottom;
+        # if they scrolled up to read, keep their position.
+        at_bottom = bar.value() >= bar.maximum() - 4
+
+        self.log_box.appendPlainText(str(message))
+
+        if at_bottom:
+            bar.setValue(bar.maximum())
 
     def on_failed(self, error):
         self.append_log(error)
@@ -621,6 +656,7 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self._set_running(False)
+        self.set_progress("")
         self.bot = None
         self.bot_thread = None
 

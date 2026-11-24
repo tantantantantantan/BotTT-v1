@@ -226,3 +226,31 @@ def test_join_button_disabled_is_waited_for_not_synthetic_clicked(site, make_bot
 
     assert bot.handle_waiting_room_entry(site.page) is True
     assert site.page.evaluate("window.joinClicks") == 1
+
+
+# ----------------------------------------------------------------------
+# Countdown output goes to the in-place progress line, not the log
+# ----------------------------------------------------------------------
+
+def test_format_remaining():
+    from bots.thaiticketmajor import ThaiTicketMajorBot
+
+    assert ThaiTicketMajorBot.format_remaining(125) == "02:05"
+    assert ThaiTicketMajorBot.format_remaining(3725) == "1:02:05"
+    assert ThaiTicketMajorBot.format_remaining(-3) == "00:00"
+
+
+def test_countdown_uses_progress_not_log(make_bot):
+    progress = []
+    bot = make_bot(progress_callback=progress.append)
+
+    bot._sleep_with_countdown(2.2, lambda left: f"left {int(left)}")
+
+    assert len(progress) >= 2
+    assert bot.logs == []
+
+
+def test_progress_falls_back_to_log_without_callback(make_bot):
+    bot = make_bot()
+    bot.progress("hello")
+    assert bot.logs == ["hello"]

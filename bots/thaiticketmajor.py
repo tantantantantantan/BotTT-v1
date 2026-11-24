@@ -171,6 +171,7 @@ class ThaiTicketMajorBot:
         onsale_refresh_seconds=2,
         status_callback=print,
         stop_callback=lambda: False,
+        progress_callback=None,
     ):
         self.event_url = (event_url or "").strip()
         self.quantity = max(1, int(quantity or 1))
@@ -255,6 +256,11 @@ class ThaiTicketMajorBot:
         self._presale_wait_done = False
 
         self.status = status_callback or print
+
+        # Countdown / queue progress: updated in place by the UI instead
+        # of appending a new log line every second. Without a progress
+        # callback (CLI) it falls back to the normal log.
+        self.progress = progress_callback or self.status
         self.should_stop = stop_callback or (lambda: False)
 
         self.selected_round = None
@@ -479,7 +485,9 @@ class ThaiTicketMajorBot:
                         continue
 
                     if state == TTMState.WAIT_SALE:
-                        self.status("⏰ ยังไม่เปิดขาย")
+                        # "State = WAIT_SALE" is already logged once;
+                        # the repeating part goes to the progress line.
+                        self.progress("⏰ ยังไม่เปิดขาย")
 
                         # fallback กรณีอ่าน sale datetime ไม่ได้:
                         # refresh เฉพาะหน้า Performance/Concert
@@ -489,8 +497,12 @@ class ThaiTicketMajorBot:
                             "/performance/" in current_url
                             or "/concert/" in current_url
                         ):
-                            time.sleep(
-                                self.presale_refresh_seconds
+                            self._sleep_with_countdown(
+                                self.presale_refresh_seconds,
+                                lambda left: (
+                                    "⏰ ยังไม่เปิดขาย | Refresh หน้า "
+                                    f"Performance ใน {int(left) + 1}s"
+                                ),
                             )
 
                             if self._queue_detected(page):
@@ -546,9 +558,15 @@ class ThaiTicketMajorBot:
                                 >= 8
                             ):
                                 self._queue_last_log_time = now_ts
-                                self.status(
+                                self.progress(
                                     "🔔 Still here? กรุณากด "
                                     "\"Yes, I'm here\" บน Browser"
+                                )
+                                self._log_throttled(
+                                    "still-here",
+                                    "🔔 Still here? กรุณากด "
+                                    "\"Yes, I'm here\" บน Browser",
+                                    every=60,
                                 )
 
                         before_queue_url = page.url
@@ -693,6 +711,37 @@ class ThaiTicketMajorBot:
             finally:
                 # ห้าม browser.close() เพราะเรา attach Chrome ที่ผู้ใช้เปิดเอง
                 self.status("🔌 Ticket Bot disconnected")
+
+    @staticmethod
+    def format_remaining(seconds):
+        """3725 -> '1:02:05', 125 -> '02:05'."""
+        seconds = max(0, int(seconds))
+        hours, rest = divmod(seconds, 3600)
+        minutes, secs = divmod(rest, 60)
+
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _sleep_with_countdown(self, seconds, message_fn):
+        """
+        Sleep in 1 s ticks, reporting message_fn(seconds_left) through
+        the progress line and honouring STOP.
+        """
+        end = time.time() + max(0.0, seconds)
+
+        while True:
+            if self.should_stop():
+                raise Exception("BOT_STOPPED")
+
+            left = end - time.time()
+
+            if left <= 0:
+                return
+
+            self.progress(message_fn(left))
+            time.sleep(min(1.0, left))
 
     def _select_round_with_retry(self, page, max_attempts=3):
         """
@@ -928,8 +977,8 @@ class ThaiTicketMajorBot:
                         )
 
                     if parts:
-                        self.status(
-                            "📊 Queue Status | " + " | ".join(parts)
+                        self.progress(
+                            "📊 Queue | " + " | ".join(parts)
                         )
 
                 if (
@@ -1345,17 +1394,15 @@ class ThaiTicketMajorBot:
             if remain <= 0:
                 break
 
-            if remain % 60 == 0 or remain < 60:
-                self.status(
-                    f"⏳ รอถึงช่วง Pre-login "
-                    f"อีก {remain}s"
-                )
-
-            time.sleep(
-                min(
-                    30,
-                    max(1, remain),
-                )
+            self._sleep_with_countdown(
+                min(30, max(1, remain)),
+                lambda left: (
+                    "⏳ รอถึงช่วง Pre-login อีก "
+                    + self.format_remaining(
+                        (prelogin_at - datetime.now()).total_seconds()
+                    )
+                    + f"  |  เปิดขาย {sale_dt:%d/%m %H:%M}"
+                ),
             )
 
         # ----------------------------------------------
@@ -1427,11 +1474,6 @@ class ThaiTicketMajorBot:
                     5,
                 )
 
-            self.status(
-                f"⏳ รอเปิดขาย {remain}s "
-                f"| เช็ค Waiting Room ทุก "
-                f"{preview_refresh}s"
-            )
 
             # ช่วง 1 ชั่วโมงก่อนขายให้เช็คค่อนข้างถี่
             # แต่ยังไม่ refresh ตอนอยู่ Queue จริง
@@ -1454,7 +1496,17 @@ class ThaiTicketMajorBot:
                 max(1, remain),
             )
 
-            time.sleep(sleep_for)
+            self._sleep_with_countdown(
+                sleep_for,
+                lambda left: (
+                    "⏳ รอเปิดขายอีก "
+                    + self.format_remaining(
+                        (sale_dt - datetime.now()).total_seconds()
+                    )
+                    + f"  |  เช็ค Waiting Room ทุก {preview_refresh}s"
+                    + f"  |  Refresh ถัดไป {int(left) + 1}s"
+                ),
+            )
 
             if datetime.now() >= sale_dt:
                 break
@@ -1543,13 +1595,17 @@ class ThaiTicketMajorBot:
                 self._presale_wait_done = True
                 return True
 
-            self.status(
-                f"🔄 On-sale check "
-                f"{attempt}/90"
+            self.progress(
+                f"🔄 เปิดขายแล้ว กำลังรอปุ่มรอบ | "
+                f"On-sale check {attempt}/90"
             )
 
-            time.sleep(
-                self.onsale_refresh_seconds
+            self._sleep_with_countdown(
+                self.onsale_refresh_seconds,
+                lambda left, attempt=attempt: (
+                    f"🔄 เปิดขายแล้ว กำลังรอปุ่มรอบ | "
+                    f"On-sale check {attempt}/90"
+                ),
             )
 
             try:
@@ -2360,8 +2416,9 @@ class ThaiTicketMajorBot:
                 self.status("✅ Login สำเร็จ")
                 return True
 
-            if second and second % 10 == 0:
-                self.status(f"⏳ Waiting Login... {second}s")
+            self.progress(
+                f"🔐 รอ Login บน Chrome... {self.format_remaining(second)}"
+            )
 
             time.sleep(1)
 
