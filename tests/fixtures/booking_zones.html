@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sanitized booking page</title></head>
+<body>
+<select id="rdId" onchange="round_change(this.value)">
+  <option value="">-- เลือกรอบการแสดง --</option>
+  <option value="1001">ส. 16 ส.ค. 2569 18:00</option>
+  <option value="1002">ส. 16 ส.ค. 2569 20:00</option>
+  <option value="1003" disabled>อา. 17 ส.ค. 2569 18:00 (Sold out)</option>
+</select>
+<div id="zones"></div>
+<script>
+  var params = new URLSearchParams(location.search);
+  var rd = params.get('rdId');
+  var sel = document.getElementById('rdId');
+  if (params.get('hidden') === '1') { sel.style.display = 'none'; }
+  if (rd) {
+    sel.value = rd;
+    document.getElementById('zones').innerHTML =
+      '<img usemap="#zmap" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" width="10" height="10">' +
+      '<map name="zmap"><area shape="rect" coords="0,0,10,10" onclick="selectzone(\'A1\')" href="#"></map>';
+  }
+  function round_change(v) {
+    params.set('rdId', v);
+    location.href = location.pathname + '?' + params.toString();
+  }
+  function selectzone(z) {}
+</script>
+</body></html>

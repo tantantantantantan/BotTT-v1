@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sanitized waiting room entry</title></head>
+<body>
+<div id="waitingroomentry-content-holder">
+  <p>คุณจะได้เข้าคิวหลังจากกดปุ่ม</p>
+  <button class="botdetect-button btn" id="join" disabled>Join waiting room</button>
+</div>
+<div id="queue" style="display:none">
+  <p>You are now in the queue. Queue number: <span id="qn">123</span></p>
+</div>
+<script>
+  var params = new URLSearchParams(location.search);
+  var readyAfter = parseInt(params.get('readyAfter') || '0', 10);
+  setTimeout(function () { document.getElementById('join').disabled = false; }, readyAfter);
+  window.joinClicks = 0;
+  document.getElementById('join').addEventListener('click', function (ev) {
+    if (!ev.isTrusted) { return; }  // like bot-detect widgets, ignore synthetic clicks
+    window.joinClicks += 1;
+    document.getElementById('waitingroomentry-content-holder').style.display = 'none';
+    document.getElementById('queue').style.display = 'block';
+  });
+</script>
+</body></html>

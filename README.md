@@ -21,9 +21,26 @@ The application connects to Chrome at `http://127.0.0.1:9222`. The launcher uses
 - `license/`: license validation and public verification key.
 - `TicketAssistant_v3_1_1.spec`, `build_exe.bat`: Windows executable packaging.
 
-## Current reported problems
+## Round selection and queue entry fixes
 
-The owner reports that selecting some show rounds and clicking to receive/join a queue do not work. These problems have not yet been reproduced or fixed. See `CLAUDE.md` for investigation starting points.
+The owner's reports ("some show rounds cannot be selected", "clicking to receive/join the queue does not work") were traced to these causes in `bots/thaiticketmajor.py`, reproduced with offline fixtures and fixed:
+
+- Performance page: only the first event block was read, and rounds whose `query` differed from the block's majority were dropped, so those rounds raised "ไม่พบรอบการแสดง". All blocks are now read; `ticket_type` filters blocks when it matches.
+- Round text matching: whitespace/newlines, `18.00` vs `18:00` and the `น.` suffix broke matches, while a partial match let `8:00` pick `18:00`. Matching is now normalized and token based (`match_rounds`).
+- A requested round that is visible but not open yet used to stop the bot; it now waits and reloads the performance page.
+- Booking dropdown `select#rdId`: AUTO replaced the round chosen on the performance page with the first option; disabled/placeholder options were not handled; a hidden native select timed out; `round_done` was set without checking the page loaded the round. The round is now confirmed (URL `rdId` / zone map) and retried at most 3 times; a missing or disabled round raises instead of continuing with another round.
+- Queue click: under on-sale load the round/queue click waited for a slow navigation, then the fallback `el.click()`/`goto` aborted or crashed it. A started navigation is now awaited without re-navigating; links that open a new tab are followed.
+- Queue detection used free page text: FAQ text on the performance page ("waiting room", "เข้าคิว") stopped the pre-sale refresh, and the queue page text "เข้าคิวแล้ว" was treated as the entry page. Detection now uses the queue host and real DOM (Join button, Queue-it widgets).
+- Join waiting room: a disabled button was "clicked" with a synthetic event that bot-detect ignores, and success was reported anyway. The bot now waits for the button to be enabled, clicks once with a real click, confirms the page changed, and otherwise retries later. CAPTCHA/visitor verification stays manual.
+
+### Tests
+
+```
+pip install playwright pytest
+python -m pytest -q tests
+```
+
+The tests use sanitized HTML fixtures in `tests/fixtures/` served through `page.route()`; every other request is aborted, so no live site is contacted. Set `TTM_TEST_CHROMIUM` to a Chromium/Chrome executable if Playwright's bundled browser is not installed. The fixtures model the selectors the bot uses; they are not captures of the live site, so live verification on a real event is still required.
 
 ## License and build notes
 

@@ -4,11 +4,116 @@ import time
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+from urllib.parse import urlparse
 
 from playwright.sync_api import (
     sync_playwright,
     TimeoutError as PlaywrightTimeoutError,
 )
+
+
+# ==============================================================
+# ROUND MATCHING HELPERS
+# ==============================================================
+
+# A clock time such as 18:00 / 18.00 / 8:05. Not part of a longer number
+# or a dotted date like 16.08.2569.
+_TIME_RE = re.compile(
+    r"(?<![\d.:/])(\d{1,2})\s*[:.]\s*(\d{2})(?![\d]|[.:/]\d)"
+)
+
+_PLACEHOLDER_RE = re.compile(
+    r"^[\s\-–—=*]*(เลือก|กรุณา|please|select|choose)",
+    flags=re.I,
+)
+
+
+def normalize_round_text(value):
+    """
+    Normalize round text for matching:
+    - lower case, collapse whitespace/newlines, commas and pipes
+    - 18.00 / 08:00 -> 18:00 / 8:00
+    - drop the Thai "น." or "hrs" suffix after a time
+    """
+    text = str(value or "").lower()
+    text = _TIME_RE.sub(
+        lambda m: f"{int(m.group(1))}:{m.group(2)}",
+        text,
+    )
+    text = re.sub(
+        r"(\d:\d{2})\s*(?:น\.?|hrs?\.?)(?=\s|$|\))",
+        r"\1",
+        text,
+    )
+    text = re.sub(r"[\s,|]+", " ", text)
+    return text.strip()
+
+
+def match_rounds(query, rounds):
+    """
+    Return every round that matches the user's show_round text, best tier
+    first. Each round is a dict with "value" (rdId, may be empty),
+    "text" (date + time) and optionally "time".
+
+    Tiers:
+      1. rdId exact (also accepts "rdId=12345")
+      2. full text or visible time exact (after normalization)
+      3. every query token appears as a whole token in the round text
+      4. query appears in the text, but never inside another number/time
+         (so "8:00" does not pick "18:00")
+    """
+    raw = str(query or "").strip()
+
+    if not raw:
+        return []
+
+    raw_value = re.sub(r"^rdid\s*=\s*", "", raw, flags=re.I).lower()
+    q = normalize_round_text(raw)
+    q_tokens = q.split()
+
+    def full_text(item):
+        return normalize_round_text(item.get("text", ""))
+
+    def tokens(item):
+        return set(
+            full_text(item).split()
+            + normalize_round_text(item.get("time", "")).split()
+        )
+
+    boundary = re.compile(
+        r"(?<![0-9:])" + re.escape(q) + r"(?![0-9:])"
+    )
+
+    tiers = [
+        lambda item: (
+            str(item.get("value") or "").strip().lower() == raw_value
+        ),
+        lambda item: q in (
+            full_text(item),
+            normalize_round_text(item.get("time", "")),
+        ),
+        lambda item: bool(q_tokens) and all(
+            token in tokens(item) for token in q_tokens
+        ),
+        lambda item: bool(boundary.search(full_text(item))),
+    ]
+
+    for matches_tier in tiers:
+        found = [item for item in rounds if matches_tier(item)]
+
+        if found:
+            return found
+
+    return []
+
+
+def is_placeholder_option(value, text):
+    value = str(value or "").strip()
+
+    if value in ("", "0", "-1"):
+        return True
+
+    return bool(_PLACEHOLDER_RE.match(str(text or "")))
 
 
 class TTMState:
@@ -169,6 +274,15 @@ class ThaiTicketMajorBot:
         self._queue_last_number = None
         self._queue_last_log_time = 0.0
         self._queue_redirect_seen = False
+        self._queue_status_page = None
+
+        # Round click may open a new tab; run() switches to it
+        self._pending_page = None
+        self._round_attempts = 0
+
+        # Waiting room join: one click at a time, throttled logs
+        self._last_join_click_time = 0.0
+        self._throttle = {}
 
         # v3.1 Fast Snapshot telemetry / stale guard
         self._scan_cycle = 1
@@ -225,6 +339,20 @@ class ThaiTicketMajorBot:
                 while not self.should_stop():
 
                     # ==================================================
+                    # ROUND LINK OPENED A NEW TAB -> FOLLOW IT
+                    # ==================================================
+                    new_page = self.take_pending_page()
+
+                    if new_page is not None:
+                        page = new_page
+                        last_state = None
+
+                        try:
+                            page.bring_to_front()
+                        except Exception:
+                            pass
+
+                    # ==================================================
                     # PRE-SALE WAIT / PRE-LOGIN
                     # ==================================================
                     if any(
@@ -279,6 +407,8 @@ class ThaiTicketMajorBot:
                     # ==================================================
 
                     if not round_done:
+                        has_round_dropdown = False
+
                         try:
                             round_select = page.locator("select#rdId").first
 
@@ -286,23 +416,30 @@ class ThaiTicketMajorBot:
                                 valid_options = round_select.locator(
                                     'option[value]:not([value=""])'
                                 )
-
-                                if valid_options.count() > 0:
-                                    self.status(
-                                        "🎭 พบ Round Dropdown → เลือกรอบก่อน Zone"
-                                    )
-
-                                    self.select_show_round(page)
-                                    round_done = True
-                                    last_state = None
-
-                                    page.wait_for_timeout(450)
-                                    continue
+                                has_round_dropdown = (
+                                    valid_options.count() > 0
+                                )
 
                         except Exception as ex:
                             self.status(
                                 f"⚠️ Round pre-check: {ex}"
                             )
+
+                        if has_round_dropdown:
+                            self.status(
+                                "🎭 พบ Round Dropdown → เลือกรอบก่อน Zone"
+                            )
+
+                            # round_done only after the site confirmed
+                            # the round (URL rdId / zone map loaded).
+                            # Errors (round not found / disabled) stop
+                            # the bot instead of booking another round.
+                            round_done = self._select_round_with_retry(
+                                page
+                            )
+                            last_state = None
+                            page.wait_for_timeout(150)
+                            continue
 
                     # Direct queue landing is valid:
                     # some events redirect from round button straight to wait.thaiticketmajor.com
@@ -333,10 +470,12 @@ class ThaiTicketMajorBot:
                         page.wait_for_timeout(100)
                         continue
 
-                    if state == TTMState.ROUND and not round_done:
-                        self.select_show_round(page)
-                        round_done = True
-                        page.wait_for_timeout(350)
+                    if state == TTMState.ROUND:
+                        # Also after a queue redirect back to a booking
+                        # page with an empty dropdown.
+                        round_done = self._select_round_with_retry(page)
+                        zone_done = False
+                        page.wait_for_timeout(150)
                         continue
 
                     if state == TTMState.WAIT_SALE:
@@ -385,18 +524,19 @@ class ThaiTicketMajorBot:
                             self.status(
                                 "🛑 ปิด Auto Refresh ระหว่าง Waiting Room/Queue"
                             )
+                            last_state = None
 
                         page.wait_for_timeout(250)
-                        last_state = None
                         continue
 
                     if state == TTMState.IN_QUEUE:
                         self._attach_queue_status_monitor(page)
 
-                        if last_state != TTMState.IN_QUEUE:
-                            self.status(
-                                "⏳ อยู่ใน Queue — ไม่ Refresh หน้า"
-                            )
+                        self._log_throttled(
+                            "in-queue",
+                            "⏳ อยู่ใน Queue — ไม่ Refresh หน้า",
+                            every=60,
+                        )
 
                         if self._visitor_presence_visible(page):
                             now_ts = time.time()
@@ -554,6 +694,26 @@ class ThaiTicketMajorBot:
                 # ห้าม browser.close() เพราะเรา attach Chrome ที่ผู้ใช้เปิดเอง
                 self.status("🔌 Ticket Bot disconnected")
 
+    def _select_round_with_retry(self, page, max_attempts=3):
+        """
+        Select the dropdown round. Returns True once confirmed.
+        After max_attempts unconfirmed tries, raise rather than continue
+        with a round the user did not ask for.
+        """
+        if self.select_show_round(page):
+            self._round_attempts = 0
+            return True
+
+        self._round_attempts += 1
+
+        if self._round_attempts >= max_attempts:
+            raise Exception(
+                "เลือกรอบการแสดงแล้วหน้าเว็บไม่โหลดรอบนั้น "
+                f"{self._round_attempts} ครั้ง"
+            )
+
+        return False
+
     # ==========================================================
     # PRE-SALE / ON-SALE WAIT
     # ==========================================================
@@ -700,7 +860,11 @@ class ThaiTicketMajorBot:
         ฟัง response ของ Queue-it /status ที่หน้าเว็บยิงเอง
         ไม่ยิง API เพิ่มเอง และไม่ refresh.
         """
-        if self._queue_status_listener_attached:
+        # One listener per page (a round click may move us to a new tab)
+        if (
+            self._queue_status_listener_attached
+            and self._queue_status_page is page
+        ):
             return
 
         def on_response(response):
@@ -782,6 +946,7 @@ class ThaiTicketMajorBot:
 
         page.on("response", on_response)
         self._queue_status_listener_attached = True
+        self._queue_status_page = page
 
         self.status(
             "📡 Queue Network Monitor พร้อม"
@@ -808,223 +973,254 @@ class ThaiTicketMajorBot:
 
         return False
 
-    def handle_waiting_room_entry(self, page):
-        """
-        รองรับหน้า Entry Zone / Waiting Room ที่มีปุ่ม:
+    JOIN_BUTTON_SELECTORS = [
+        "#waitingroomentry-content-holder button.botdetect-button.btn",
+        "#waitingroomentry-content-holder button",
+        'button:has-text("Join waiting room")',
+        'button:has-text("Join Waiting Room")',
+        'button:has-text("Join queue")',
+        'button:has-text("กดเพื่อรอรับคิว")',
+    ]
 
-            #waitingroomentry-content-holder
-            button.botdetect-button.btn
-            "Join waiting room"
+    QUEUE_DOM_SELECTORS = [
+        "#MainPart_divProgressbar",
+        "#MainPart_lbQueueNumber",
+        "#challenge-widget-container",
+        "#divConfirmVisitorPresenceModal",
+    ]
 
-        Bot จะกดปุ่ม Join waiting room ให้เพียงครั้งเดียว แล้วหยุด
-        auto-refresh ทันที
+    @staticmethod
+    def _host(page):
+        try:
+            return (urlparse(page.url or "").hostname or "").lower()
+        except Exception:
+            return ""
 
-        ถ้าหลังจากกดเว็บแสดง challenge/CAPTCHA/visitor verification
-        Bot จะไม่พยายาม bypass และจะรอให้ผู้ใช้ดำเนินการบน Browser เอง.
-        """
+    def _is_queue_host(self, page):
+        host = self._host(page)
+        url = (page.url or "").lower()
 
-        # --------------------------------------------------
-        # FIND JOIN BUTTON
-        # --------------------------------------------------
-        selectors = [
-            "#waitingroomentry-content-holder "
-            "button.botdetect-button.btn",
-            "#waitingroomentry-content-holder button",
-            'button:has-text("Join waiting room")',
-            'button:has-text("Join Waiting Room")',
-        ]
+        return (
+            host.startswith("wait.")
+            or host.startswith("queue.")
+            or host.startswith("busy.")
+            or "queue-it" in host
+            or "queue-it" in url
+        )
 
-        button = None
+    def _is_ttm_content_page(self, page):
+        """Event (performance/concert) or booking pages of TTM itself."""
+        host = self._host(page)
+        url = (page.url or "").lower()
 
-        for selector in selectors:
+        if not host.endswith("thaiticketmajor.com"):
+            return False
+
+        if self._is_queue_host(page):
+            return False
+
+        return (
+            "/performance/" in url
+            or "/concert/" in url
+            or host.startswith("booking.")
+            or "/booking/" in url
+        )
+
+    def _find_join_button(self, page):
+        """Visible Join waiting room button in the page or any frame."""
+        try:
+            frames = [page.main_frame] + [
+                frame
+                for frame in page.frames
+                if frame != page.main_frame
+            ]
+        except Exception:
+            frames = [page]
+
+        for frame in frames:
+            for selector in self.JOIN_BUTTON_SELECTORS:
+                try:
+                    loc = frame.locator(selector).first
+
+                    if loc.count() > 0 and loc.is_visible():
+                        return loc
+                except Exception:
+                    pass
+
+        return None
+
+    def _queue_dom_visible(self, page):
+        for selector in self.QUEUE_DOM_SELECTORS:
             try:
                 loc = page.locator(selector).first
 
-                if (
-                    loc.count() > 0
-                    and loc.is_visible()
-                ):
-                    button = loc
-                    break
-
+                if loc.count() > 0 and loc.is_visible():
+                    return True
             except Exception:
                 pass
 
+        return False
+
+    def _log_throttled(self, key, message, every=8.0):
+        now_ts = time.time()
+
+        if now_ts - self._throttle.get(key, 0.0) >= every:
+            self._throttle[key] = now_ts
+            self.status(message)
+
+    def handle_waiting_room_entry(self, page):
+        """
+        Click "Join waiting room" once, with a real (trusted) mouse click,
+        and confirm the page actually moved on.
+
+        Returns True only when the join was confirmed (entry holder gone,
+        navigation, queue UI or a verification challenge appeared).
+        Returns False when the button is missing / not ready / the click
+        was not accepted, so the main loop retries later. Never refreshes.
+
+        If the site shows CAPTCHA / visitor verification the bot does not
+        try to bypass it; the user completes it in the browser.
+        """
+
+        if self.should_stop():
+            raise Exception("BOT_STOPPED")
+
+        button = self._find_join_button(page)
+
         if button is None:
+            self._log_throttled(
+                "join-missing",
+                "⏳ หน้า Waiting Room ยังไม่แสดงปุ่ม Join → รอ (ไม่ Refresh)",
+            )
             return False
 
-        self.status(
-            "🎟️ พบปุ่ม Join waiting room"
-        )
+        # Button is often rendered disabled until the widget is ready.
+        # Clicking a disabled button does nothing, so wait for it.
+        enabled = False
 
-        # --------------------------------------------------
-        # CLICK ACTUAL BUTTON
-        # --------------------------------------------------
+        for _ in range(100):  # ~10 sec
+            if self.should_stop():
+                raise Exception("BOT_STOPPED")
+
+            try:
+                enabled = button.is_enabled()
+            except Exception:
+                enabled = False
+
+            if enabled:
+                break
+
+            self._log_throttled(
+                "join-disabled",
+                "⏳ ปุ่ม Join waiting room ยังกดไม่ได้ (disabled) → รอ",
+            )
+            page.wait_for_timeout(100)
+
+        if not enabled:
+            return False
+
+        # Do not hammer the button: one click, then give the site time.
+        if time.time() - self._last_join_click_time < 8:
+            return False
+
+        self.status("🎟️ พบปุ่ม Join waiting room")
+
+        before_url = page.url
+
         try:
-            button.scroll_into_view_if_needed()
+            button.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
 
         try:
-            button.click(
-                timeout=2500,
-            )
-
-            self.status(
-                "✅ Click Join waiting room สำเร็จ"
-            )
-
+            button.click(timeout=5000)
+            self._last_join_click_time = time.time()
+            self.status("✅ Click Join waiting room แล้ว → รอยืนยัน")
         except Exception as ex:
+            # A synthetic DOM click is ignored by the site's bot-detect
+            # widget and used to be reported as success. Retry instead.
             self.status(
-                f"⚠️ Normal Join click ไม่ผ่าน: {ex}"
+                f"⚠️ Click Join waiting room ไม่ผ่าน: {ex}"
             )
-
-            try:
-                button.evaluate(
-                    """
-                    el => el.dispatchEvent(
-                        new MouseEvent("click", {
-                            bubbles: true,
-                            cancelable: true,
-                            view: window
-                        })
-                    )
-                    """
-                )
-
-                self.status(
-                    "✅ Trigger Join waiting room สำเร็จ"
-                )
-
-            except Exception as ex2:
-                self.status(
-                    f"❌ Join waiting room ไม่สำเร็จ: {ex2}"
-                )
-                return False
+            self.status(
+                "👤 ถ้ามี popup/แบนเนอร์บังปุ่ม กรุณาปิดบน Browser"
+            )
+            self._last_join_click_time = time.time()
+            return False
 
         # --------------------------------------------------
-        # WAIT FOR QUEUE / CHALLENGE
+        # CONFIRM: challenge / holder gone / navigation / queue UI
         # --------------------------------------------------
-        for _ in range(60):  # ~6 sec
+        for _ in range(80):  # ~8 sec
             if self.should_stop():
                 raise Exception("BOT_STOPPED")
 
-            # Challenge / verification visible
             try:
                 challenge = page.locator(
                     "#challenge-widget-container"
                 ).first
 
-                if (
-                    challenge.count() > 0
-                    and challenge.is_visible()
-                ):
+                if challenge.count() > 0 and challenge.is_visible():
                     self._attach_queue_status_monitor(page)
                     self.status(
                         "🧩 พบ Visitor Verification / Challenge"
                     )
                     self.status(
-                        "👤 กรุณาดำเนินการ Challenge บน Browser "
-                        "หากเว็บร้องขอ"
+                        "👤 กรุณาดำเนินการ Challenge บน Browser เอง"
                     )
                     return True
             except Exception:
                 pass
 
-            # Waiting room entry button disappeared = click accepted
-            try:
-                holder = page.locator(
-                    "#waitingroomentry-content-holder"
-                ).first
+            if page.url != before_url:
+                self._attach_queue_status_monitor(page)
+                self.status("⏳ เข้าสู่ Waiting Room / Queue แล้ว")
+                self.status(f"🌐 {page.url}")
+                return True
 
-                if (
-                    holder.count() == 0
-                    or not holder.is_visible()
-                ):
-                    self._attach_queue_status_monitor(page)
-                    self.status(
-                        "⏳ เข้าสู่ Waiting Room แล้ว"
-                    )
-                    return True
-            except Exception:
-                pass
+            if self._find_join_button(page) is None:
+                self._attach_queue_status_monitor(page)
+                self.status("⏳ เข้าสู่ Waiting Room แล้ว")
+                return True
 
-            # Queue page/state changed
-            try:
-                body = (
-                    page.locator("body")
-                    .inner_text(timeout=400)
-                    .lower()
-                )
-
-                if any(
-                    token in body
-                    for token in [
-                        "your queue",
-                        "queue number",
-                        "estimated wait",
-                        "you are in line",
-                        "หมายเลขคิว",
-                        "อยู่ในคิว",
-                        "กำลังรอคิว",
-                    ]
-                ):
-                    self._attach_queue_status_monitor(page)
-                    self.status(
-                        "⏳ อยู่ใน Queue แล้ว"
-                    )
-                    return True
-
-            except Exception:
-                pass
+            if self._queue_dom_visible(page):
+                self._attach_queue_status_monitor(page)
+                self.status("⏳ อยู่ใน Queue แล้ว")
+                return True
 
             page.wait_for_timeout(100)
 
-        # Click may still have been accepted even if DOM does not change fast.
-        self._attach_queue_status_monitor(page)
         self.status(
-            "ℹ️ กด Join waiting room แล้ว "
-            "กำลังรอระบบ Queue"
+            "⚠️ กด Join แล้วแต่หน้าเว็บยังไม่เปลี่ยน "
+            "→ จะลองกดใหม่อีกครั้ง (ไม่ Refresh)"
         )
-        return True
+        return False
 
     def _queue_detected(self, page):
         """
-        สำคัญ:
-        ถ้าเข้า Queue จริงแล้ว จะไม่ refresh อัตโนมัติ
+        True when the page is a waiting room / queue.
+
+        สำคัญ: ถ้าเข้า Queue จริงแล้ว จะไม่ refresh อัตโนมัติ
         เพื่อไม่เสี่ยงเสียลำดับคิว.
+
+        Event/booking pages of TTM are judged only by DOM (join button,
+        Queue-it widgets), never by free body text: their FAQ text often
+        mentions "waiting room" / "เข้าคิว", which used to stop the
+        pre-sale refresh forever.
         """
 
         try:
-            url = (page.url or "").lower()
-
-            queue_url_tokens = [
-                "queue",
-                "waiting",
-                "waitingroom",
-                "busy.",
-            ]
-
-            if any(
-                token in url
-                for token in queue_url_tokens
-            ):
+            if self._is_queue_host(page):
                 return True
 
-            # Waiting Room Entry page
-            try:
-                join_btn = page.locator(
-                    "#waitingroomentry-content-holder "
-                    "button.botdetect-button.btn"
-                ).first
+            if self._find_join_button(page) is not None:
+                return True
 
-                if (
-                    join_btn.count() > 0
-                    and join_btn.is_visible()
-                ):
-                    return True
-            except Exception:
-                pass
+            if self._queue_dom_visible(page):
+                return True
+
+            if self._is_ttm_content_page(page):
+                return False
 
             body = (
                 page.locator("body")
@@ -1035,14 +1231,13 @@ class ThaiTicketMajorBot:
             return any(
                 token in body
                 for token in [
-                    "join waiting room",
-                    "waiting room",
+                    "you are now in the queue",
+                    "your place in the queue",
                     "queue number",
                     "your queue",
                     "หมายเลขคิว",
                     "กำลังรอคิว",
                     "อยู่ในคิว",
-                    "รอคิว",
                 ]
             )
 
@@ -1376,9 +1571,335 @@ class ThaiTicketMajorBot:
     # PERFORMANCE PAGE ROUND ENTRY
     # ==========================================================
 
+    ROUND_LINK_SELECTOR = (
+        '.col-btn a.btn'
+        '[href*="/booking/3m/zones.php"]'
+        '[href*="query="]'
+    )
+
+    def take_pending_page(self):
+        """Return (and clear) a tab opened by a round click, if any."""
+        new_page = self._pending_page
+        self._pending_page = None
+        return new_page
+
+    def _read_performance_rounds(self, page):
+        """
+        Read every round of #section-event-round, across ALL event blocks.
+
+        Returns (enabled, closed):
+          enabled: clickable rounds (.row.row-enable) with element/href
+          closed:  rows that exist but are not enabled yet / sold out
+        """
+        blocks = page.locator(
+            "#section-event-round .event-detail-item"
+        )
+
+        enabled = []
+        closed = []
+
+        for block_index in range(blocks.count()):
+            block = blocks.nth(block_index)
+
+            try:
+                block_text = (
+                    block.inner_text(timeout=800) or ""
+                ).strip()
+            except Exception:
+                block_text = ""
+
+            links = block.locator(
+                ".row.row-enable " + self.ROUND_LINK_SELECTOR
+            )
+
+            for i in range(links.count()):
+                link = links.nth(i)
+
+                try:
+                    href = link.get_attribute("href") or ""
+
+                    query_match = re.search(
+                        r"[?&]query=(\d+)", href, flags=re.I
+                    )
+
+                    if not query_match:
+                        continue
+
+                    rd_match = re.search(
+                        r"[?&]rdId=(\d+)", href, flags=re.I
+                    )
+
+                    time_text = ""
+
+                    try:
+                        show = link.locator(".item-show").first
+
+                        if show.count() > 0:
+                            time_text = (
+                                show.inner_text(timeout=500) or ""
+                            ).strip()
+                    except Exception:
+                        pass
+
+                    if not time_text:
+                        try:
+                            time_text = (
+                                link.inner_text(timeout=500) or ""
+                            ).strip()
+                        except Exception:
+                            time_text = ""
+
+                    date_text = ""
+
+                    try:
+                        row = link.locator(
+                            "xpath=ancestor::div[contains("
+                            "concat(' ', normalize-space(@class), ' '),"
+                            " ' row ')][1]"
+                        )
+
+                        if row.count() > 0:
+                            label = row.locator(".col-label").first
+
+                            if label.count() > 0:
+                                date_text = (
+                                    label.inner_text(timeout=500)
+                                    or ""
+                                ).strip()
+                    except Exception:
+                        pass
+
+                    enabled.append(
+                        {
+                            "element": link,
+                            "href": href,
+                            "query": query_match.group(1),
+                            "value": (
+                                rd_match.group(1) if rd_match else ""
+                            ),
+                            "time": time_text,
+                            "date": date_text,
+                            "text": f"{date_text} {time_text}".strip(),
+                            "block_index": block_index,
+                            "block_text": block_text,
+                        }
+                    )
+
+                except Exception:
+                    continue
+
+            # Rounds shown but not clickable yet (not on sale / sold out)
+            try:
+                rows = block.locator(".row:not(.row-enable)")
+
+                for i in range(rows.count()):
+                    row = rows.nth(i)
+
+                    if row.locator(".col-btn").count() == 0:
+                        continue
+
+                    row_text = (
+                        row.inner_text(timeout=500) or ""
+                    ).strip()
+
+                    if row_text:
+                        closed.append(
+                            {
+                                "value": "",
+                                "text": row_text,
+                                "block_index": block_index,
+                            }
+                        )
+            except Exception:
+                pass
+
+        return enabled, closed
+
+    def _wait_or_reload_performance(self, page):
+        """Requested round is visible but not open yet: wait, then reload."""
+        wait_s = max(1, self.onsale_refresh_seconds)
+        end = time.time() + wait_s
+
+        while time.time() < end:
+            if self.should_stop():
+                raise Exception("BOT_STOPPED")
+            time.sleep(0.1)
+
+        if self._queue_detected(page):
+            return
+
+        try:
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+        except Exception:
+            pass
+
+    def _click_and_follow(self, page, link, href):
+        """
+        Click a real round/queue link and wait until something happens.
+
+        - URL changes (booking / conditions / queue)      -> True
+        - link opens a new tab                            -> True, tab is
+          handed to run() through take_pending_page()
+        - a navigation was started but the site is slow   -> keep waiting,
+          never re-navigate (that would abort the queue redirect)
+        - nothing happened at all after ~8 s              -> page.goto(href)
+        """
+        state = {"nav": False, "nav_failed": False, "popup": None}
+        main_frame = page.main_frame
+
+        def on_request(request):
+            try:
+                if (
+                    request.is_navigation_request()
+                    and request.frame == main_frame
+                ):
+                    state["nav"] = True
+            except Exception:
+                pass
+
+        def on_request_failed(request):
+            try:
+                if (
+                    request.is_navigation_request()
+                    and request.frame == main_frame
+                ):
+                    state["nav_failed"] = True
+            except Exception:
+                pass
+
+        def on_popup(popup):
+            state["popup"] = popup
+
+        page.on("request", on_request)
+        page.on("requestfailed", on_request_failed)
+        page.on("popup", on_popup)
+
+        before_url = page.url
+        started = time.time()
+
+        try:
+            try:
+                link.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+
+            try:
+                link.click(timeout=4000)
+            except Exception as ex:
+                if state["nav"] or state["popup"] is not None:
+                    # The click went through; Playwright only timed out
+                    # waiting for the (slow) navigation it started.
+                    pass
+                else:
+                    self.status(f"⚠️ Normal round click: {ex}")
+
+                    try:
+                        # fallback DOM click - still the site's own element
+                        link.evaluate("el => el.click()", timeout=3000)
+                    except Exception as ex2:
+                        self.status(f"⚠️ DOM click: {ex2}")
+
+            pending_logged = False
+
+            while True:
+                if self.should_stop():
+                    raise Exception("BOT_STOPPED")
+
+                popup = state["popup"]
+
+                if popup is not None:
+                    try:
+                        popup.wait_for_load_state(
+                            "domcontentloaded", timeout=30000
+                        )
+                    except Exception:
+                        pass
+
+                    self._pending_page = popup
+                    self.status("🗂️ รอบเปิดใน Tab ใหม่ → ย้ายไปทำงานที่ Tab ใหม่")
+                    self.status(f"🌐 {popup.url}")
+                    return True
+
+                current_url = page.url
+
+                if current_url != before_url:
+                    self.status("✅ รอบถูกกดแล้ว")
+                    self.status(f"🌐 {current_url}")
+                    return True
+
+                if self._queue_detected(page):
+                    self.status("🎟️ เข้าระบบ Queue แล้ว")
+                    return True
+
+                try:
+                    if (
+                        page.locator("select#rdId").count() > 0
+                        or page.locator(
+                            'map area[onclick*="selectzone"]'
+                        ).count() > 0
+                        or page.locator("#tableseats").count() > 0
+                    ):
+                        self.status("✅ เข้าหน้า Booking แล้ว")
+                        return True
+                except Exception:
+                    pass
+
+                elapsed = time.time() - started
+
+                if elapsed > 8:
+                    if state["nav"] and not state["nav_failed"]:
+                        if elapsed > 90:
+                            self.status(
+                                "⚠️ เว็บตอบช้ามาก (>90s) หลังกดรอบ"
+                            )
+                            return True
+
+                        if not pending_logged:
+                            pending_logged = True
+                            self.status(
+                                "⏳ เว็บกำลังโหลดหลังกดรอบ/รับคิว "
+                                "→ รอ ไม่โหลดซ้ำ (กันเสียคิว)"
+                            )
+                    else:
+                        break
+
+                page.wait_for_timeout(100)
+
+        finally:
+            for event, handler in (
+                ("request", on_request),
+                ("requestfailed", on_request_failed),
+                ("popup", on_popup),
+            ):
+                try:
+                    page.remove_listener(event, handler)
+                except Exception:
+                    pass
+
+        # Nothing happened at all: use the button's own href once.
+        self.status(
+            "⚠️ Click รอบไม่ทำให้หน้าเปลี่ยน "
+            "→ ใช้ href ของปุ่มเป็น fallback"
+        )
+
+        try:
+            page.goto(
+                href,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except Exception as ex:
+            self.status(f"⚠️ เปิด href ไม่สำเร็จ: {ex}")
+
+        self.status(f"🌐 {page.url}")
+        return True
+
     def handle_performance_page(self, page):
         """
-        Performance / On-sale handler v2.1
+        Performance / On-sale handler v2.2
 
         รองรับ 2 รูปแบบ:
         1) รอบปกติ:
@@ -1395,234 +1916,57 @@ class ThaiTicketMajorBot:
                    .item-hide = รับคิวซื้อบัตร
 
         หลักสำคัญ:
-        - ใช้เฉพาะ .row-enable เท่านั้น
-        - เลือก event block จาก DOM จริง ไม่เก็บปุ่มซื้อบัตรจากส่วนอื่น
-        - ถ้ามี ticket_type จะพยายามเลือก block ที่มีข้อความตรงกัน
+        - ใช้เฉพาะ .row-enable ใน #section-event-round
+        - อ่านรอบจากทุก event block (เดิมดูแค่ block แรก ทำให้รอบใน
+          block อื่นเลือกไม่ได้) และไม่ตัดรอบที่ query ต่างกันทิ้ง
+        - ticket_type ใช้กรอง block ถ้ามี block ที่ข้อความตรง
+        - รอบที่ขอยังไม่เปิด -> รอแล้ว reload หน้า Performance
         - กด anchor จริงด้วย Playwright เพื่อให้ Queue/JS ของเว็บทำงาน
+          ถ้าเว็บกำลังโหลดจะรอ ไม่ goto ซ้ำ (กันเสียคิว)
         - ค่าว่างของ show_round = AUTO
         """
 
         url = (page.url or "").lower()
 
-        if (
-            "/performance/" not in url
-            and "/concert/" not in url
-        ):
+        if "/performance/" not in url and "/concert/" not in url:
             return False
 
-        # ==========================================================
-        # FIND ENABLED EVENT BLOCKS
-        # ==========================================================
-
-        event_blocks = page.locator(
-            "#section-event-round .event-detail-item"
-        )
-
-        block_candidates = []
-
-        for i in range(event_blocks.count()):
-            block = event_blocks.nth(i)
-
-            try:
-                enabled_links = block.locator(
-                    '.row.row-enable '
-                    '.col-btn a.btn'
-                    '[href*="/booking/3m/zones.php"]'
-                    '[href*="query="]'
-                )
-
-                if enabled_links.count() == 0:
-                    continue
-
-                try:
-                    block_text = (
-                        block.inner_text(timeout=800)
-                        or ""
-                    ).strip()
-                except Exception:
-                    block_text = ""
-
-                block_candidates.append(
-                    {
-                        "index": i,
-                        "block": block,
-                        "text": block_text,
-                        "count": enabled_links.count(),
-                    }
-                )
-
-            except Exception:
-                continue
+        rounds, closed = self._read_performance_rounds(page)
 
         # ยังไม่มี row-enable = ยังไม่เปิดให้กด
-        if not block_candidates:
-            return False
-
-        # ==========================================================
-        # CHOOSE EVENT BLOCK
-        # ==========================================================
-
-        chosen_block = None
-
-        ticket_query = (
-            self.ticket_type.strip().lower()
-            if self.ticket_type
-            else ""
-        )
-
-        if ticket_query:
-            for item in block_candidates:
-                if ticket_query in item["text"].lower():
-                    chosen_block = item
-                    self.status(
-                        "🎫 Match Event Block จาก Ticket Type: "
-                        f"{self.ticket_type}"
-                    )
-                    break
-
-        if chosen_block is None:
-            # ใช้ block แรกที่มี row-enable ตามลำดับ DOM
-            # ป้องกันไปหยิบ CTA/recommendation อื่นนอก section
-            chosen_block = block_candidates[0]
-
-        block = chosen_block["block"]
-
-        self.status(
-            "🔥 SALE OPEN / พบ Event Round ที่กดได้"
-        )
-
-        # ==========================================================
-        # READ ONLY ENABLED ROUND LINKS IN SELECTED BLOCK
-        # ==========================================================
-
-        links = block.locator(
-            '.row.row-enable '
-            '.col-btn a.btn'
-            '[href*="/booking/3m/zones.php"]'
-            '[href*="query="]'
-        )
-
-        rounds = []
-
-        for i in range(links.count()):
-            link = links.nth(i)
-
-            try:
-                href = link.get_attribute("href") or ""
-
-                if not href:
-                    continue
-
-                query_match = re.search(
-                    r"[?&]query=(\d+)",
-                    href,
-                    flags=re.I,
-                )
-
-                if not query_match:
-                    continue
-
-                rd_match = re.search(
-                    r"[?&]rdId=(\d+)",
-                    href,
-                    flags=re.I,
-                )
-
-                # เวลาในปุ่ม ใช้ .item-show เป็นหลัก
-                time_text = ""
-
-                try:
-                    show = link.locator(
-                        ".item-show"
-                    ).first
-
-                    if show.count() > 0:
-                        time_text = (
-                            show.inner_text(timeout=500)
-                            or ""
-                        ).strip()
-                except Exception:
-                    pass
-
-                if not time_text:
-                    try:
-                        time_text = (
-                            link.inner_text(timeout=500)
-                            or ""
-                        ).strip()
-                    except Exception:
-                        time_text = ""
-
-                # หา date label จาก row / DOM ใกล้เคียง
-                date_text = ""
-
-                try:
-                    row = link.locator(
-                        "xpath=ancestor::div[contains(@class,'row')][1]"
-                    )
-
-                    if row.count() > 0:
-                        label = row.locator(
-                            ".col-label"
-                        ).first
-
-                        if label.count() > 0:
-                            date_text = (
-                                label.inner_text(timeout=500)
-                                or ""
-                            ).strip()
-                except Exception:
-                    pass
-
-                rounds.append(
-                    {
-                        "element": link,
-                        "href": href,
-                        "query": query_match.group(1),
-                        "value": (
-                            rd_match.group(1)
-                            if rd_match
-                            else ""
-                        ),
-                        "time": time_text,
-                        "date": date_text,
-                        "text": (
-                            f"{date_text} {time_text}"
-                        ).strip(),
-                    }
-                )
-
-            except Exception:
-                continue
-
         if not rounds:
             return False
 
-        # Safety: ใช้ query หลักใน block นี้
-        query_counter = Counter(
-            item["query"]
-            for item in rounds
-        )
+        # ==========================================================
+        # TICKET TYPE -> EVENT BLOCK FILTER
+        # ==========================================================
 
-        event_query = (
-            query_counter.most_common(1)[0][0]
-        )
+        pool = rounds
+        ticket_query = (self.ticket_type or "").strip().lower()
 
-        rounds = [
-            item
-            for item in rounds
-            if item["query"] == event_query
-        ]
+        if ticket_query:
+            filtered = [
+                item
+                for item in rounds
+                if ticket_query in item["block_text"].lower()
+            ]
 
-        self.status(
-            f"🎫 Performance Event query={event_query}"
-        )
+            if filtered:
+                pool = filtered
+                self.status(
+                    "🎫 Match Event Block จาก Ticket Type: "
+                    f"{self.ticket_type}"
+                )
+            else:
+                self.status(
+                    f"⚠️ ไม่พบ Event Block ที่ตรง Ticket Type "
+                    f"'{self.ticket_type}' → ใช้ทุก Block"
+                )
 
-        self.status(
-            f"🎭 พบรอบที่กดได้ {len(rounds)} รอบ"
-        )
+        self.status("🔥 SALE OPEN / พบ Event Round ที่กดได้")
+        self.status(f"🎭 พบรอบที่กดได้ {len(pool)} รอบ")
 
-        for item in rounds:
+        for item in pool:
             rd_text = (
                 f"rdId={item['value']}"
                 if item["value"]
@@ -1630,179 +1974,71 @@ class ThaiTicketMajorBot:
             )
 
             self.status(
-                f"• {item['text']} | {rd_text}"
+                f"• {item['text']} | query={item['query']} | {rd_text}"
             )
 
         # ==========================================================
         # SELECT ROUND
         # ==========================================================
 
+        requested = (self.show_round or "").strip() or "AUTO"
         target = None
 
-        requested = (
-            self.show_round.strip()
-            if self.show_round
-            else "AUTO"
-        )
-
-        if not requested:
-            requested = "AUTO"
-
         if requested.upper() != "AUTO":
-            q = requested.lower()
+            matches = match_rounds(requested, pool)
 
-            # rdId exact
-            target = next(
-                (
-                    x
-                    for x in rounds
-                    if x["value"]
-                    and x["value"].lower() == q
-                ),
-                None,
-            )
+            if not matches and pool is not rounds:
+                matches = match_rounds(requested, rounds)
 
-            # Full date/time exact
-            if target is None:
-                target = next(
-                    (
-                        x
-                        for x in rounds
-                        if x["text"].lower() == q
-                    ),
-                    None,
+            if not matches:
+                if match_rounds(requested, closed):
+                    self._log_throttled(
+                        "round-not-open",
+                        f"⏰ รอบ {requested} ยังไม่เปิดให้กด "
+                        f"→ รอ {self.onsale_refresh_seconds}s แล้ว Refresh",
+                        every=10,
+                    )
+                    self._wait_or_reload_performance(page)
+                    return True
+
+                available = ", ".join(
+                    item["text"] or item["value"] for item in pool
                 )
-
-            # Visible time exact เช่น 18:00
-            if target is None:
-                target = next(
-                    (
-                        x
-                        for x in rounds
-                        if x["time"].lower() == q
-                    ),
-                    None,
-                )
-
-            # Partial match
-            if target is None:
-                target = next(
-                    (
-                        x
-                        for x in rounds
-                        if q in x["text"].lower()
-                    ),
-                    None,
-                )
-
-            if target is None:
                 raise Exception(
-                    f"ไม่พบรอบการแสดง {self.show_round}"
+                    f"ไม่พบรอบการแสดง {requested} | "
+                    f"รอบที่กดได้: {available}"
                 )
+
+            if len(matches) > 1:
+                self.status(
+                    f"⚠️ '{requested}' ตรงหลายรอบ "
+                    f"({len(matches)}) → เลือกรอบแรก "
+                    "ระบุวันที่เพิ่มเพื่อความแม่นยำ"
+                )
+
+            target = matches[0]
 
         if target is None:
-            target = rounds[0]
+            target = pool[0]
 
         self.selected_round = {
             "value": target["value"],
             "text": target["text"],
         }
 
-        self.status(
-            "🎯 เลือกรอบ: "
-            f"{target['text']}"
-        )
+        self.status(f"🎯 เลือกรอบ: {target['text']}")
 
         # ==========================================================
         # CLICK ACTUAL ON-SALE / QUEUE BUTTON
         # ==========================================================
 
-        before_url = page.url
-        target_link = target["element"]
+        self.status("🚀 Click รอบ / รับคิวซื้อบัตร")
 
-        self.status(
-            "🚀 Click รอบ / รับคิวซื้อบัตร"
-        )
-
-        try:
-            target_link.scroll_into_view_if_needed()
-
-            target_link.click(
-                timeout=4000,
-            )
-
-        except Exception as ex:
-            self.status(
-                f"⚠️ Normal round click: {ex}"
-            )
-
-            # fallback DOM click - ยังใช้ element จริงของเว็บ
-            target_link.evaluate(
-                "el => el.click()"
-            )
-
-        # ==========================================================
-        # WAIT QUEUE / BOOKING NAVIGATION
-        # ==========================================================
-
-        for _ in range(80):  # ~8 sec
-            if self.should_stop():
-                raise Exception("BOT_STOPPED")
-
-            current_url = page.url
-
-            if current_url != before_url:
-                self.status(
-                    "✅ รอบถูกกดแล้ว"
-                )
-                self.status(
-                    f"🌐 {current_url}"
-                )
-                return True
-
-            if self._queue_detected(page):
-                self.status(
-                    "🎟️ เข้าระบบ Queue แล้ว"
-                )
-                return True
-
-            try:
-                if (
-                    page.locator("select#rdId").count() > 0
-                    or page.locator(
-                        'map area[onclick*="selectzone"]'
-                    ).count() > 0
-                    or page.locator(
-                        "#tableseats"
-                    ).count() > 0
-                ):
-                    self.status(
-                        "✅ เข้าหน้า Booking แล้ว"
-                    )
-                    return True
-            except Exception:
-                pass
-
-            page.wait_for_timeout(100)
-
-        # ถ้าคลิกไม่เกิดอะไรจริง ๆ ให้ใช้ href จากปุ่มเดิม
-        # เป็น fallback สุดท้ายเท่านั้น
-        self.status(
-            "⚠️ Click รอบยังไม่เปลี่ยนหน้า "
-            "→ ใช้ href ของปุ่มเป็น fallback"
-        )
-
-        page.goto(
+        return self._click_and_follow(
+            page,
+            target["element"],
             target["href"],
-            wait_until="domcontentloaded",
-            timeout=30000,
         )
-
-        self.status(
-            f"🌐 {page.url}"
-        )
-
-        return True
 
     # ==========================================================
     # DIRECT BOOKING ENTRY
@@ -2154,8 +2390,18 @@ class ThaiTicketMajorBot:
 
             if rd.count() > 0:
                 current = (rd.input_value() or "").strip()
+                current_text = ""
 
-                if not current:
+                try:
+                    current_text = rd.evaluate(
+                        "el => el.selectedIndex >= 0 "
+                        "? (el.options[el.selectedIndex].textContent || '') "
+                        ": ''"
+                    )
+                except Exception:
+                    pass
+
+                if is_placeholder_option(current, current_text):
                     return TTMState.ROUND
         except Exception:
             pass
@@ -2179,6 +2425,17 @@ class ThaiTicketMajorBot:
         except Exception:
             pass
 
+        # --------------------------------------------------
+        # WAITING ROOM ENTRY: only when a real Join button is
+        # visible. Free text such as "เข้าคิว" also appears on
+        # the queue page itself ("คุณได้เข้าคิวแล้ว") and on
+        # performance FAQ text.
+        # --------------------------------------------------
+        if self._find_join_button(page) is not None:
+            return TTMState.QUEUE_ENTRY
+
+        is_content_page = self._is_ttm_content_page(page)
+
         try:
             body = (
                 page.locator("body")
@@ -2188,53 +2445,26 @@ class ThaiTicketMajorBot:
         except Exception:
             body = ""
 
-        # --------------------------------------------------
-        # WAITING ROOM ENTRY
-        # ต้องเช็กก่อน IN_QUEUE เพราะหน้า Entry มีคำว่า
-        # "waiting room" อยู่ใน body เช่นกัน
-        # --------------------------------------------------
-        try:
-            join_button = page.locator(
-                "#waitingroomentry-content-holder "
-                "button.botdetect-button.btn"
-            ).first
-
-            if (
-                join_button.count() > 0
-                and join_button.is_visible()
+        if self._is_queue_host(page):
+            if any(
+                text in body
+                for text in [
+                    "join waiting room",
+                    "join queue",
+                    "get in line",
+                    "กดเพื่อรอรับคิว",
+                ]
             ):
+                # Entry page whose button is not rendered yet.
                 return TTMState.QUEUE_ENTRY
-        except Exception:
-            pass
 
-        if any(
-            text in body
-            for text in [
-                "join waiting room",
-                "get in line",
-                "join queue",
-                "กดเพื่อรอรับคิว",
-                "เข้าคิว",
-            ]
-        ):
-            return TTMState.QUEUE_ENTRY
+            # Any other page on the queue host: never refresh it.
+            return TTMState.IN_QUEUE
 
-        # Queue-it actual queue page
-        try:
-            current_url = (page.url or "").lower()
+        if self._queue_dom_visible(page):
+            return TTMState.IN_QUEUE
 
-            if (
-                "wait.thaiticketmajor.com" in current_url
-                and (
-                    "/view" in current_url
-                    or "queue" in current_url
-                )
-            ):
-                return TTMState.IN_QUEUE
-        except Exception:
-            pass
-
-        if any(
+        if not is_content_page and any(
             text in body
             for text in [
                 "you are now in the queue",
@@ -2272,11 +2502,8 @@ class ThaiTicketMajorBot:
                 or "/concert/" in current_url
             ):
                 enabled_rounds = page.locator(
-                    "#section-event-round "
-                    ".row.row-enable "
-                    '.col-btn a.btn'
-                    '[href*="/booking/3m/zones.php"]'
-                    '[href*="query="]'
+                    "#section-event-round .row.row-enable "
+                    + self.ROUND_LINK_SELECTOR
                 ).count()
 
                 if enabled_rounds == 0:
@@ -2296,27 +2523,130 @@ class ThaiTicketMajorBot:
         if select.count() == 0:
             return []
 
+        try:
+            options = select.evaluate(
+                """
+                el => Array.from(el.options).map(o => ({
+                    value: o.value,
+                    text: (o.textContent || '').trim(),
+                    disabled: !!o.disabled,
+                }))
+                """
+            )
+        except Exception:
+            return []
+
         rounds = []
-        options = select.locator("option")
 
-        for i in range(options.count()):
-            option = options.nth(i)
-            value = option.get_attribute("value") or ""
-            text = (option.text_content() or "").strip()
+        for option in options:
+            value = (option.get("value") or "").strip()
+            text = re.sub(r"\s+", " ", option.get("text") or "").strip()
 
-            if not value:
+            if is_placeholder_option(value, text):
                 continue
 
             rounds.append(
                 {
                     "value": value,
                     "text": text,
+                    "disabled": bool(option.get("disabled")),
                 }
             )
 
         return rounds
 
+    @staticmethod
+    def _url_rd_id(url):
+        match = re.search(r"[?&]rdId=([^&#]+)", url or "", flags=re.I)
+        return match.group(1) if match else ""
+
+    def _choose_dropdown_round(self, page, rounds):
+        enabled = [r for r in rounds if not r["disabled"]]
+        requested = (self.show_round or "").strip() or "AUTO"
+
+        # 1) Round already chosen on the performance page (rdId link).
+        #    Previously AUTO overrode it with the first dropdown option.
+        chosen_value = (self.selected_round or {}).get("value") or ""
+
+        if chosen_value:
+            target = next(
+                (r for r in enabled if r["value"] == chosen_value),
+                None,
+            )
+
+            if target is not None:
+                self.status("ℹ️ ใช้รอบที่เลือกจากหน้า Performance")
+                return target
+
+        # 2) Explicit show_round
+        if requested.upper() != "AUTO":
+            matches = match_rounds(requested, rounds)
+
+            if not matches:
+                available = ", ".join(r["text"] for r in enabled)
+                raise Exception(
+                    f"ไม่พบรอบการแสดง {requested} | "
+                    f"รอบที่เลือกได้: {available}"
+                )
+
+            open_matches = [r for r in matches if not r["disabled"]]
+
+            if not open_matches:
+                raise Exception(
+                    f"รอบการแสดง {requested} ถูกปิด/เต็ม (disabled) "
+                    f"| {matches[0]['text']}"
+                )
+
+            if len(open_matches) > 1:
+                self.status(
+                    f"⚠️ '{requested}' ตรงหลายรอบ "
+                    f"({len(open_matches)}) → เลือกรอบแรก"
+                )
+
+            return open_matches[0]
+
+        if not enabled:
+            raise Exception("ทุกรอบการแสดงถูกปิด/เต็ม (disabled)")
+
+        # 3) AUTO: keep the round already loaded in the URL
+        url_rd = self._url_rd_id(page.url)
+
+        if url_rd:
+            target = next(
+                (r for r in enabled if r["value"] == url_rd),
+                None,
+            )
+
+            if target is not None:
+                return target
+
+        return enabled[0]
+
+    def _round_page_ready(self, page, value):
+        """Zone map / seats loaded for the round currently in the dropdown."""
+        try:
+            select = page.locator("select#rdId").first
+
+            if select.count() > 0:
+                if (select.input_value() or "").strip() != value:
+                    return False
+
+            return (
+                page.locator('map area[onclick*="selectzone"]').count() > 0
+                or page.locator("#tableseats").count() > 0
+            )
+        except Exception:
+            return False
+
     def select_show_round(self, page):
+        """
+        Select the round in the booking page dropdown (select#rdId) and
+        confirm that the site actually loaded it.
+
+        Returns True when confirmed, False when the page did not react
+        (the caller retries). Raises when the round does not exist or is
+        disabled, instead of silently continuing with another round.
+        """
         rounds = self.read_show_rounds(page)
 
         if not rounds:
@@ -2325,49 +2655,10 @@ class ThaiTicketMajorBot:
         self.status(f"🎭 พบรอบการแสดง {len(rounds)} รอบ")
 
         for item in rounds:
-            self.status(f'• {item["value"]} | {item["text"]}')
+            flag = " [ปิด]" if item["disabled"] else ""
+            self.status(f'• {item["value"]} | {item["text"]}{flag}')
 
-        target = None
-
-        if self.show_round and self.show_round.upper() != "AUTO":
-            query = self.show_round.lower()
-
-            target = next(
-                (
-                    x
-                    for x in rounds
-                    if x["value"].lower() == query
-                ),
-                None,
-            )
-
-            if target is None:
-                target = next(
-                    (
-                        x
-                        for x in rounds
-                        if x["text"].lower() == query
-                    ),
-                    None,
-                )
-
-            if target is None:
-                target = next(
-                    (
-                        x
-                        for x in rounds
-                        if query in x["text"].lower()
-                    ),
-                    None,
-                )
-
-            if target is None:
-                raise Exception(
-                    f"ไม่พบรอบการแสดง {self.show_round}"
-                )
-
-        if target is None:
-            target = rounds[0]
+        target = self._choose_dropdown_round(page, rounds)
 
         self.status(f'🎯 เลือกรอบ: {target["text"]}')
 
@@ -2378,38 +2669,152 @@ class ThaiTicketMajorBot:
         except Exception:
             current_value = ""
 
-        # ถ้าค่าปัจจุบันกับ target ต่างกัน ใช้ select_option ตามปกติ
-        if current_value != target["value"]:
-            select.select_option(value=target["value"])
+        before_url = page.url
 
-        else:
-            # บางหน้า TTM default รอบแรกไว้แล้ว
-            # ถ้าเลือกค่าเดิม browser อาจไม่ยิง onchange
-            # จึง trigger change เอง เพื่อให้ round_change() ของเว็บทำงาน
+        # Already loaded: do not fire change again (it reloads the page).
+        if current_value == target["value"] and (
+            self._url_rd_id(before_url) == target["value"]
+            or self._round_page_ready(page, target["value"])
+        ):
+            self.selected_round = target
             self.status(
-                "ℹ️ Round นี้ถูกเลือกอยู่แล้ว → Trigger change event"
+                f"✅ รอบนี้ถูกโหลดอยู่แล้ว | value={target['value']}"
+            )
+            return True
+
+        nav = {"started": False}
+        main_frame = page.main_frame
+
+        def on_request(request):
+            try:
+                if (
+                    request.is_navigation_request()
+                    and request.frame == main_frame
+                ):
+                    nav["started"] = True
+            except Exception:
+                pass
+
+        page.on("request", on_request)
+
+        try:
+            if current_value != target["value"]:
+                selected = False
+
+                try:
+                    if select.is_visible():
+                        select.select_option(
+                            value=target["value"],
+                            timeout=3000,
+                        )
+                        selected = True
+                except Exception as ex:
+                    self.status(f"⚠️ select_option: {ex}")
+
+                if not selected and not nav["started"]:
+                    # Native select hidden behind a custom dropdown UI:
+                    # set the value and fire the site's own change handler.
+                    self.status(
+                        "ℹ️ Dropdown ถูกซ่อน → ตั้งค่าและ Trigger change"
+                    )
+                    self._set_select_value(select, target["value"])
+            else:
+                # Default round already selected but not loaded:
+                # browser does not fire onchange for the same value.
+                self.status(
+                    "ℹ️ Round นี้ถูกเลือกอยู่แล้ว → Trigger change event"
+                )
+                self._set_select_value(select, target["value"])
+
+            confirmed = self._confirm_round_loaded(
+                page, target, before_url, nav
+            )
+        finally:
+            try:
+                page.remove_listener("request", on_request)
+            except Exception:
+                pass
+
+        if confirmed:
+            self.selected_round = target
+            self.status(
+                f"✅ เลือกรอบการแสดงสำเร็จ | value={target['value']}"
+            )
+        else:
+            self.status(
+                "⚠️ เลือกรอบแล้วแต่หน้าเว็บยังไม่โหลดรอบนี้"
             )
 
+        return confirmed
+
+    @staticmethod
+    def _set_select_value(select, value):
+        try:
             select.evaluate(
                 """
-                el => {
-                    el.dispatchEvent(
-                        new Event("change", {
-                            bubbles: true
-                        })
-                    );
+                (el, v) => {
+                    el.value = v;
+                    el.dispatchEvent(new Event("input", {bubbles: true}));
+                    el.dispatchEvent(new Event("change", {bubbles: true}));
                 }
-                """
+                """,
+                value,
+                timeout=3000,
             )
+        except Exception:
+            # The change handler may navigate immediately.
+            pass
 
-        self.selected_round = target
+    def _confirm_round_loaded(self, page, target, before_url, nav, timeout=20):
+        value = target["value"]
+        started = time.time()
 
-        # รอหน้าเว็บประมวลผล round_change()
-        page.wait_for_timeout(1500)
+        while time.time() - started < timeout:
+            if self.should_stop():
+                raise Exception("BOT_STOPPED")
 
-        self.status(
-            f"✅ เลือกรอบการแสดงสำเร็จ | value={target['value']}"
-        )
+            current_url = page.url
+
+            if self._url_rd_id(current_url) == value:
+                try:
+                    page.wait_for_load_state(
+                        "domcontentloaded", timeout=10000
+                    )
+                except Exception:
+                    pass
+                return True
+
+            if current_url != before_url:
+                low = current_url.lower()
+
+                # Redirected to queue / conditions after choosing round
+                if (
+                    self._is_queue_host(page)
+                    or "verify_condition.php" in low
+                ):
+                    return True
+
+                try:
+                    page.wait_for_load_state(
+                        "domcontentloaded", timeout=10000
+                    )
+                except Exception:
+                    pass
+
+                if self._round_page_ready(page, value):
+                    return True
+
+            # Same-page (AJAX) round loading
+            if (
+                not nav["started"]
+                and time.time() - started > 2.5
+                and self._round_page_ready(page, value)
+            ):
+                return True
+
+            page.wait_for_timeout(100)
+
+        return False
 
     # ==========================================================
     # ZONE

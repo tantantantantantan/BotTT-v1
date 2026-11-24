@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sanitized on-sale page</title></head>
+<body>
+<div id="section-event-round">
+  <div class="event-detail-item">
+    <div class="row row-enable">
+      <div class="col-label">ส. 16 ส.ค. 2569</div>
+      <div class="col-btn">
+        <a class="btn" id="queue-link" href="https://booking.thaiticketmajor.com/booking/3m/zones.php?query=695"><span class="item-show">18:00</span><span class="item-hide" style="display:none">รับคิวซื้อบัตร</span></a>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+  // Optional behaviours selected by the test through the URL hash.
+  var mode = location.hash.replace('#', '');
+  var link = document.getElementById('queue-link');
+  if (mode === 'newtab') { link.target = '_blank'; }
+</script>
+</body></html>
