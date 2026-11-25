@@ -254,3 +254,82 @@ def test_progress_falls_back_to_log_without_callback(make_bot):
     bot = make_bot()
     bot.progress("hello")
     assert bot.logs == ["hello"]
+
+
+# ----------------------------------------------------------------------
+# Zone map (image map with 40 zones)
+# ----------------------------------------------------------------------
+
+ZONE_MAP = "https://booking.thaiticketmajor.com/booking/3m/zonemap.php?query=700&rdId=1001"
+
+
+def test_read_zones_reads_all_areas(site, make_bot):
+    site.page.goto(ZONE_MAP)
+    bot = make_bot()
+
+    names = [z["name"] for z in bot.read_zones(site.page)]
+
+    assert len(names) == 40
+    assert names[:2] == ["A1", "A2"] and "HH" in names and "SB" in names
+
+
+def test_zone_is_opened_with_a_real_click(site, make_bot):
+    site.page.goto(ZONE_MAP)
+    bot = make_bot(selection_mode="ZONE", preferred_zone="D8")
+
+    assert bot.handle_zone(site.page) is True
+    clicks = site.page.evaluate("window.zoneClicks")
+    assert clicks == [{"zone": "D8", "trusted": True}]
+    assert bot.detect_state(site.page) == "SEAT"
+
+
+def test_sold_out_zone_with_popup_fails_over_to_next_priority(site, make_bot):
+    site.page.goto(ZONE_MAP + "&soldout=A1&popup=1")
+    bot = make_bot(selection_mode="ZONE", preferred_zone="A1,A2")
+
+    assert bot.handle_zone(site.page) is True
+    assert bot.selected_zone == "A2"
+    zones = [c["zone"] for c in site.page.evaluate("window.zoneClicks")]
+    assert zones == ["A1", "A2"]
+
+
+def test_sold_out_zone_without_popup_fails_over(site, make_bot):
+    site.page.goto(ZONE_MAP + "&soldout=A1")
+    bot = make_bot(selection_mode="ZONE", preferred_zone="A1,A2")
+    bot.zone_seat_wait_ms = 800
+
+    assert bot.handle_zone(site.page) is True
+    assert bot.selected_zone == "A2"
+
+
+def test_all_zones_closed_returns_false_for_next_scan_cycle(site, make_bot):
+    site.page.goto(ZONE_MAP + "&soldout=A1,A2")
+    bot = make_bot(selection_mode="ZONE", preferred_zone="A1,A2")
+    bot.zone_seat_wait_ms = 500
+
+    assert bot.handle_zone(site.page) is False
+    assert bot._scan_cycle == 2
+
+
+def test_round_button_enabled_by_js_is_seen_without_reload(site, make_bot):
+    site.page.goto(PERF_PRESALE)
+    bot = make_bot()
+    site.page.evaluate(
+        """
+        setTimeout(() => {
+            const row = document.querySelector('#section-event-round .row');
+            row.classList.add('row-enable');
+            row.querySelector('.col-btn').innerHTML =
+              '<a class="btn" href="https://booking.thaiticketmajor.com/booking/3m/zones.php?query=695">18:00</a>';
+        }, 400);
+        """
+    )
+
+    opened = bot._sleep_with_countdown(
+        5,
+        lambda left: "wait",
+        until=lambda: bot._enabled_round_count(site.page) > 0,
+    )
+
+    assert opened is True
+    assert site.count("/performance/presale.html") == 1

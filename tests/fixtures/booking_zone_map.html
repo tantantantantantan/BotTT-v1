@@ -1,0 +1,74 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sanitized zone map</title></head>
+<body>
+<!-- Sanitized fixture: image-map zones like the booking zone page. Not a live capture. -->
+<select id="rdId"><option value="1001" selected>ส. 16 ส.ค. 2569 18:00</option></select>
+<div style="margin:20px"><img usemap="#zmap" width="480" height="240" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='480' height='240'/%3E"></div>
+<map name="zmap">
+<area shape="rect" coords="0,0,50,30" href="#A1" onclick="selectzone(this.href, event); return false;" alt="Zone A1">
+<area shape="rect" coords="60,0,110,30" href="#A2" onclick="selectzone(this.href, event); return false;" alt="Zone A2">
+<area shape="rect" coords="120,0,170,30" href="#A3" onclick="selectzone(this.href, event); return false;" alt="Zone A3">
+<area shape="rect" coords="180,0,230,30" href="#A4" onclick="selectzone(this.href, event); return false;" alt="Zone A4">
+<area shape="rect" coords="240,0,290,30" href="#A5" onclick="selectzone(this.href, event); return false;" alt="Zone A5">
+<area shape="rect" coords="300,0,350,30" href="#A6" onclick="selectzone(this.href, event); return false;" alt="Zone A6">
+<area shape="rect" coords="360,0,410,30" href="#A7" onclick="selectzone(this.href, event); return false;" alt="Zone A7">
+<area shape="rect" coords="420,0,470,30" href="#A8" onclick="selectzone(this.href, event); return false;" alt="Zone A8">
+<area shape="rect" coords="0,40,50,70" href="#B1" onclick="selectzone(this.href, event); return false;" alt="Zone B1">
+<area shape="rect" coords="60,40,110,70" href="#B2" onclick="selectzone(this.href, event); return false;" alt="Zone B2">
+<area shape="rect" coords="120,40,170,70" href="#B3" onclick="selectzone(this.href, event); return false;" alt="Zone B3">
+<area shape="rect" coords="180,40,230,70" href="#B4" onclick="selectzone(this.href, event); return false;" alt="Zone B4">
+<area shape="rect" coords="240,40,290,70" href="#B5" onclick="selectzone(this.href, event); return false;" alt="Zone B5">
+<area shape="rect" coords="300,40,350,70" href="#B6" onclick="selectzone(this.href, event); return false;" alt="Zone B6">
+<area shape="rect" coords="360,40,410,70" href="#B7" onclick="selectzone(this.href, event); return false;" alt="Zone B7">
+<area shape="rect" coords="420,40,470,70" href="#B8" onclick="selectzone(this.href, event); return false;" alt="Zone B8">
+<area shape="rect" coords="0,80,50,110" href="#C1" onclick="selectzone(this.href, event); return false;" alt="Zone C1">
+<area shape="rect" coords="60,80,110,110" href="#C2" onclick="selectzone(this.href, event); return false;" alt="Zone C2">
+<area shape="rect" coords="120,80,170,110" href="#C3" onclick="selectzone(this.href, event); return false;" alt="Zone C3">
+<area shape="rect" coords="180,80,230,110" href="#C4" onclick="selectzone(this.href, event); return false;" alt="Zone C4">
+<area shape="rect" coords="240,80,290,110" href="#C5" onclick="selectzone(this.href, event); return false;" alt="Zone C5">
+<area shape="rect" coords="300,80,350,110" href="#C6" onclick="selectzone(this.href, event); return false;" alt="Zone C6">
+<area shape="rect" coords="360,80,410,110" href="#C7" onclick="selectzone(this.href, event); return false;" alt="Zone C7">
+<area shape="rect" coords="420,80,470,110" href="#C8" onclick="selectzone(this.href, event); return false;" alt="Zone C8">
+<area shape="rect" coords="0,120,50,150" href="#D1" onclick="selectzone(this.href, event); return false;" alt="Zone D1">
+<area shape="rect" coords="60,120,110,150" href="#D2" onclick="selectzone(this.href, event); return false;" alt="Zone D2">
+<area shape="rect" coords="120,120,170,150" href="#D3" onclick="selectzone(this.href, event); return false;" alt="Zone D3">
+<area shape="rect" coords="180,120,230,150" href="#D4" onclick="selectzone(this.href, event); return false;" alt="Zone D4">
+<area shape="rect" coords="240,120,290,150" href="#D5" onclick="selectzone(this.href, event); return false;" alt="Zone D5">
+<area shape="rect" coords="300,120,350,150" href="#D6" onclick="selectzone(this.href, event); return false;" alt="Zone D6">
+<area shape="rect" coords="360,120,410,150" href="#D7" onclick="selectzone(this.href, event); return false;" alt="Zone D7">
+<area shape="rect" coords="420,120,470,150" href="#D8" onclick="selectzone(this.href, event); return false;" alt="Zone D8">
+<area shape="rect" coords="0,160,50,190" href="#SB" onclick="selectzone(this.href, event); return false;" alt="Zone SB">
+<area shape="rect" coords="60,160,110,190" href="#SC" onclick="selectzone(this.href, event); return false;" alt="Zone SC">
+<area shape="rect" coords="120,160,170,190" href="#SD" onclick="selectzone(this.href, event); return false;" alt="Zone SD">
+<area shape="rect" coords="180,160,230,190" href="#FF" onclick="selectzone(this.href, event); return false;" alt="Zone FF">
+<area shape="rect" coords="240,160,290,190" href="#HH" onclick="selectzone(this.href, event); return false;" alt="Zone HH">
+<area shape="rect" coords="300,160,350,190" href="#C" onclick="selectzone(this.href, event); return false;" alt="Zone C">
+<area shape="rect" coords="360,160,410,190" href="#D" onclick="selectzone(this.href, event); return false;" alt="Zone D">
+<area shape="rect" coords="420,160,470,190" href="#E" onclick="selectzone(this.href, event); return false;" alt="Zone E">
+</map>
+<div id="seats"></div>
+<div id="popup_alert" style="display:none">Zone is not available. <a href="#" onclick="this.parentNode.style.display='none';return false;" class="fancybox-close">Close</a></div>
+<script>
+  window.zoneClicks = [];
+  // Zones listed in ?soldout=A1,A2 never load a seat map.
+  var soldout = (new URLSearchParams(location.search).get('soldout') || '').split(',');
+  function selectzone(href, ev) {
+    var z = href.split('#').pop();
+    window.zoneClicks.push({zone: z, trusted: !!(ev && ev.isTrusted)});
+    if (soldout.indexOf(z) >= 0) {
+      if (new URLSearchParams(location.search).get('popup') === '1') {
+        document.getElementById('popup_alert').style.display = 'block';
+      }
+      return false;
+    }
+    setTimeout(function () {
+      var html = '<table id="tableseats"><tr>';
+      for (var i = 1; i <= 6; i++) {
+        html += '<td title="' + z + '-A' + i + '" data-info=\'{"id":"' + i + '","seat":"3500","seatk":"k' + i + '"}\'></td>';
+      }
+      document.getElementById('seats').innerHTML = html + '</tr></table>';
+    }, 150);
+    return false;
+  }
+</script>
+</body></html>

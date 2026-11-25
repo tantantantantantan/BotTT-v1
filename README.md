@@ -33,6 +33,23 @@ The owner's reports ("some show rounds cannot be selected", "clicking to receive
 - Queue detection used free page text: FAQ text on the performance page ("waiting room", "เข้าคิว") stopped the pre-sale refresh, and the queue page text "เข้าคิวแล้ว" was treated as the entry page. Detection now uses the queue host and real DOM (Join button, Queue-it widgets).
 - Join waiting room: a disabled button was "clicked" with a synthetic event that bot-detect ignores, and success was reported anyway. The bot now waits for the button to be enabled, clicks once with a real click, confirms the page changed, and otherwise retries later. CAPTCHA/visitor verification stays manual.
 
+
+## Speed and accuracy changes
+
+Measured with the offline fixtures (local headless Chromium; over CDP to a real Chrome each saved round-trip is worth more):
+
+| Step | Before | After |
+|---|---|---|
+| Read rounds on the performance page | 107 ms | 3 ms |
+| Read a 40-zone image map | 957 ms | ~45 ms |
+| Click zone until the seat map is ready | 3.6 s | ~0.25 s |
+
+- Rounds and zones are read with one in-page JavaScript call instead of one call per element/attribute.
+- Zones are clicked with a real mouse click on their position in the map image. The old Playwright click on `<area>` always timed out (2.2 s) and fell back to a synthetic JS call.
+- A zone that does not open (sold out / popup) now fails over to the next zone in priority instead of stopping the bot; a site popup ends the wait immediately. When all zones fail, a new scan cycle starts.
+- While waiting for the sale, the bot watches the local DOM every 0.2 s, so a round button enabled by the page's own JavaScript is clicked without waiting for the next reload. This sends no extra requests to the site.
+- Removed a fixed 350 ms delay after the zone step.
+
 ### Tests
 
 ```

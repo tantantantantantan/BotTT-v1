@@ -30,6 +30,7 @@ ROUTES = {
     ("event.thaiticketmajor.com", "/performance/presale.html"): "performance_presale.html",
     ("event.thaiticketmajor.com", "/performance/queue-link.html"): "performance_queue_link.html",
     ("booking.thaiticketmajor.com", "/booking/3m/zones.php"): "booking_zones.html",
+    ("booking.thaiticketmajor.com", "/booking/3m/zonemap.php"): "booking_zone_map.html",
     ("wait.thaiticketmajor.com", "/entry"): "waiting_room_entry.html",
     ("wait.thaiticketmajor.com", "/view"): "queue_view.html",
 }

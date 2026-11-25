@@ -296,6 +296,9 @@ class ThaiTicketMajorBot:
         self._consecutive_seat_failures = 0
         self._stale_rescan_threshold = 5
 
+        # How long a clicked zone may take to show its seat map
+        self.zone_seat_wait_ms = 6000
+
     # ==========================================================
     # MAIN
     # ==========================================================
@@ -497,13 +500,18 @@ class ThaiTicketMajorBot:
                             "/performance/" in current_url
                             or "/concert/" in current_url
                         ):
-                            self._sleep_with_countdown(
+                            if self._sleep_with_countdown(
                                 self.presale_refresh_seconds,
-                                lambda left: (
+                                until=lambda: (
+                                    self._enabled_round_count(page) > 0
+                                ),
+                                message_fn=lambda left: (
                                     "⏰ ยังไม่เปิดขาย | Refresh หน้า "
                                     f"Performance ใน {int(left) + 1}s"
                                 ),
-                            )
+                            ):
+                                # Button appeared without reload
+                                continue
 
                             if self._queue_detected(page):
                                 self.status(
@@ -593,9 +601,9 @@ class ThaiTicketMajorBot:
                         continue
 
                     if state == TTMState.ZONE and not zone_done:
-                        self.handle_zone(page)
-                        zone_done = True
-                        page.wait_for_timeout(350)
+                        # handle_zone already waited for the seat map;
+                        # no extra fixed delay on the critical path.
+                        zone_done = self.handle_zone(page)
                         continue
 
                     if state == TTMState.SEAT:
@@ -724,24 +732,50 @@ class ThaiTicketMajorBot:
 
         return f"{minutes:02d}:{secs:02d}"
 
-    def _sleep_with_countdown(self, seconds, message_fn):
+    def _sleep_with_countdown(self, seconds, message_fn, until=None, poll=0.2):
         """
-        Sleep in 1 s ticks, reporting message_fn(seconds_left) through
-        the progress line and honouring STOP.
+        Wait up to `seconds`, reporting message_fn(seconds_left) once a
+        second through the progress line and honouring STOP.
+
+        If `until` is given it is polled every `poll` seconds and the wait
+        ends early (returns True) as soon as it is truthy. It must only
+        read the local DOM: it never sends requests to the site.
         """
         end = time.time() + max(0.0, seconds)
+        next_report = 0.0
 
         while True:
             if self.should_stop():
                 raise Exception("BOT_STOPPED")
 
-            left = end - time.time()
+            if until is not None:
+                try:
+                    if until():
+                        return True
+                except Exception:
+                    pass
+
+            now = time.time()
+            left = end - now
 
             if left <= 0:
-                return
+                return False
 
-            self.progress(message_fn(left))
-            time.sleep(min(1.0, left))
+            if now >= next_report:
+                self.progress(message_fn(left))
+                next_report = now + 1.0
+
+            time.sleep(min(poll if until is not None else 1.0, left))
+
+    def _enabled_round_count(self, page):
+        """Clickable round buttons on a performance page (DOM only)."""
+        try:
+            return page.locator(
+                "#section-event-round .row.row-enable "
+                + self.ROUND_LINK_SELECTOR
+            ).count()
+        except Exception:
+            return 0
 
     def _select_round_with_retry(self, page, max_attempts=3):
         """
@@ -1333,13 +1367,7 @@ class ThaiTicketMajorBot:
         # If an enabled round button exists, stop waiting now.
         # --------------------------------------------------
         try:
-            enabled_rounds = page.locator(
-                "#section-event-round "
-                ".row.row-enable "
-                '.col-btn a.btn'
-                '[href*="/booking/3m/zones.php"]'
-                '[href*="query="]'
-            ).count()
+            enabled_rounds = self._enabled_round_count(page)
         except Exception:
             enabled_rounds = 0
 
@@ -1428,13 +1456,7 @@ class ThaiTicketMajorBot:
             # Do NOT keep waiting for sale_dt if buttons are live.
             # --------------------------------------------------
             try:
-                enabled_rounds = page.locator(
-                    "#section-event-round "
-                    ".row.row-enable "
-                    '.col-btn a.btn'
-                    '[href*="/booking/3m/zones.php"]'
-                    '[href*="query="]'
-                ).count()
+                enabled_rounds = self._enabled_round_count(page)
             except Exception:
                 enabled_rounds = 0
 
@@ -1496,9 +1518,10 @@ class ThaiTicketMajorBot:
                 max(1, remain),
             )
 
-            self._sleep_with_countdown(
+            opened_early = self._sleep_with_countdown(
                 sleep_for,
-                lambda left: (
+                until=lambda: self._enabled_round_count(page) > 0,
+                message_fn=lambda left: (
                     "⏳ รอเปิดขายอีก "
                     + self.format_remaining(
                         (sale_dt - datetime.now()).total_seconds()
@@ -1507,6 +1530,11 @@ class ThaiTicketMajorBot:
                     + f"  |  Refresh ถัดไป {int(left) + 1}s"
                 ),
             )
+
+            if opened_early:
+                self.status("🔥 ปุ่มรอบเปิดระหว่างรอ → ไปกดรอบทันที")
+                self._presale_wait_done = True
+                return True
 
             if datetime.now() >= sale_dt:
                 break
@@ -1529,13 +1557,7 @@ class ThaiTicketMajorBot:
 
                 # ตรวจทันทีหลัง reload
                 try:
-                    enabled_rounds = page.locator(
-                        "#section-event-round "
-                        ".row.row-enable "
-                        '.col-btn a.btn'
-                        '[href*="/booking/3m/zones.php"]'
-                        '[href*="query="]'
-                    ).count()
+                    enabled_rounds = self._enabled_round_count(page)
                 except Exception:
                     enabled_rounds = 0
 
@@ -1567,13 +1589,7 @@ class ThaiTicketMajorBot:
                 return True
 
             try:
-                round_links = page.locator(
-                    "#section-event-round "
-                    ".row.row-enable "
-                    '.col-btn a.btn'
-                    '[href*="/booking/3m/zones.php"]'
-                    '[href*="query="]'
-                ).count()
+                round_links = self._enabled_round_count(page)
             except Exception:
                 round_links = 0
 
@@ -1600,13 +1616,17 @@ class ThaiTicketMajorBot:
                 f"On-sale check {attempt}/90"
             )
 
-            self._sleep_with_countdown(
+            if self._sleep_with_countdown(
                 self.onsale_refresh_seconds,
-                lambda left, attempt=attempt: (
+                until=lambda: self._enabled_round_count(page) > 0,
+                message_fn=lambda left, attempt=attempt: (
                     f"🔄 เปิดขายแล้ว กำลังรอปุ่มรอบ | "
                     f"On-sale check {attempt}/90"
                 ),
-            )
+            ):
+                self.status("✅ ปุ่มรอบเปิดแล้ว (ไม่ต้อง Refresh)")
+                self._presale_wait_done = True
+                return True
 
             try:
                 page.reload(
@@ -1639,135 +1659,105 @@ class ThaiTicketMajorBot:
         self._pending_page = None
         return new_page
 
+    # One round-trip for the whole #section-event-round (critical path
+    # at on-sale time: see button -> read rounds -> click).
+    _ROUNDS_SNAPSHOT_JS = """
+    (blocks, linkSelector) => blocks.map(block => {
+        const text = el => ((el && (el.innerText || el.textContent)) || '').trim();
+        const rowOf = el => {
+            let node = el.parentElement;
+            while (node && node !== block) {
+                if (node.classList && node.classList.contains('row')) { return node; }
+                node = node.parentElement;
+            }
+            return null;
+        };
+        const links = Array.from(
+            block.querySelectorAll('.row.row-enable ' + linkSelector)
+        ).map((link, linkIndex) => {
+            const show = link.querySelector('.item-show');
+            const row = rowOf(link);
+            const label = row ? row.querySelector('.col-label') : null;
+            return {
+                linkIndex,
+                href: link.getAttribute('href') || '',
+                time: text(show) || text(link),
+                date: text(label),
+            };
+        });
+        const closed = Array.from(block.querySelectorAll('.row:not(.row-enable)'))
+            .filter(row => row.querySelector('.col-btn'))
+            .map(row => text(row))
+            .filter(Boolean);
+        return {text: text(block), links, closed};
+    })
+    """
+
     def _read_performance_rounds(self, page):
         """
-        Read every round of #section-event-round, across ALL event blocks.
+        Read every round of #section-event-round, across ALL event blocks,
+        in a single browser round-trip.
 
         Returns (enabled, closed):
           enabled: clickable rounds (.row.row-enable) with element/href
           closed:  rows that exist but are not enabled yet / sold out
         """
-        blocks = page.locator(
+        blocks_locator = page.locator(
             "#section-event-round .event-detail-item"
         )
+
+        try:
+            blocks = blocks_locator.evaluate_all(
+                self._ROUNDS_SNAPSHOT_JS,
+                self.ROUND_LINK_SELECTOR,
+            ) or []
+        except Exception:
+            blocks = []
 
         enabled = []
         closed = []
 
-        for block_index in range(blocks.count()):
-            block = blocks.nth(block_index)
+        for block_index, block in enumerate(blocks):
+            block_text = block.get("text") or ""
 
-            try:
-                block_text = (
-                    block.inner_text(timeout=800) or ""
-                ).strip()
-            except Exception:
-                block_text = ""
+            for link in block.get("links") or []:
+                href = link.get("href") or ""
 
-            links = block.locator(
-                ".row.row-enable " + self.ROUND_LINK_SELECTOR
-            )
+                query_match = re.search(r"[?&]query=(\d+)", href, flags=re.I)
 
-            for i in range(links.count()):
-                link = links.nth(i)
-
-                try:
-                    href = link.get_attribute("href") or ""
-
-                    query_match = re.search(
-                        r"[?&]query=(\d+)", href, flags=re.I
-                    )
-
-                    if not query_match:
-                        continue
-
-                    rd_match = re.search(
-                        r"[?&]rdId=(\d+)", href, flags=re.I
-                    )
-
-                    time_text = ""
-
-                    try:
-                        show = link.locator(".item-show").first
-
-                        if show.count() > 0:
-                            time_text = (
-                                show.inner_text(timeout=500) or ""
-                            ).strip()
-                    except Exception:
-                        pass
-
-                    if not time_text:
-                        try:
-                            time_text = (
-                                link.inner_text(timeout=500) or ""
-                            ).strip()
-                        except Exception:
-                            time_text = ""
-
-                    date_text = ""
-
-                    try:
-                        row = link.locator(
-                            "xpath=ancestor::div[contains("
-                            "concat(' ', normalize-space(@class), ' '),"
-                            " ' row ')][1]"
-                        )
-
-                        if row.count() > 0:
-                            label = row.locator(".col-label").first
-
-                            if label.count() > 0:
-                                date_text = (
-                                    label.inner_text(timeout=500)
-                                    or ""
-                                ).strip()
-                    except Exception:
-                        pass
-
-                    enabled.append(
-                        {
-                            "element": link,
-                            "href": href,
-                            "query": query_match.group(1),
-                            "value": (
-                                rd_match.group(1) if rd_match else ""
-                            ),
-                            "time": time_text,
-                            "date": date_text,
-                            "text": f"{date_text} {time_text}".strip(),
-                            "block_index": block_index,
-                            "block_text": block_text,
-                        }
-                    )
-
-                except Exception:
+                if not query_match:
                     continue
 
-            # Rounds shown but not clickable yet (not on sale / sold out)
-            try:
-                rows = block.locator(".row:not(.row-enable)")
+                rd_match = re.search(r"[?&]rdId=(\d+)", href, flags=re.I)
+                time_text = (link.get("time") or "").strip()
+                date_text = (link.get("date") or "").strip()
 
-                for i in range(rows.count()):
-                    row = rows.nth(i)
+                enabled.append(
+                    {
+                        "element": (
+                            blocks_locator.nth(block_index)
+                            .locator(".row.row-enable " + self.ROUND_LINK_SELECTOR)
+                            .nth(link["linkIndex"])
+                        ),
+                        "href": href,
+                        "query": query_match.group(1),
+                        "value": rd_match.group(1) if rd_match else "",
+                        "time": time_text,
+                        "date": date_text,
+                        "text": f"{date_text} {time_text}".strip(),
+                        "block_index": block_index,
+                        "block_text": block_text,
+                    }
+                )
 
-                    if row.locator(".col-btn").count() == 0:
-                        continue
-
-                    row_text = (
-                        row.inner_text(timeout=500) or ""
-                    ).strip()
-
-                    if row_text:
-                        closed.append(
-                            {
-                                "value": "",
-                                "text": row_text,
-                                "block_index": block_index,
-                            }
-                        )
-            except Exception:
-                pass
+            for row_text in block.get("closed") or []:
+                closed.append(
+                    {
+                        "value": "",
+                        "text": row_text,
+                        "block_index": block_index,
+                    }
+                )
 
         return enabled, closed
 
@@ -2925,57 +2915,123 @@ class ThaiTicketMajorBot:
 
         return value.upper()
 
-    def _extract_zone_name_from_area(self, area):
-        """
-        พยายามอ่านชื่อ Zone จากหลาย source ใน <area>
-        เพื่อรองรับ layout ที่ไม่ได้เก็บ Zone ไว้ใน href แบบเดียว.
-        """
-        href = area.get_attribute("href") or ""
-        onclick = area.get_attribute("onclick") or ""
+    ZONE_NAME_ATTRS = [
+        "data-zone",
+        "data-zone-name",
+        "data-zonecode",
+        "data-zone-code",
+        "title",
+        "alt",
+        "name",
+        "id",
+    ]
+
+    # One round-trip for the whole image map. Each area also gets a
+    # viewport point that hit-tests to that area, so it can be clicked
+    # with a real mouse click (Playwright cannot click <area> directly).
+    _ZONE_SNAPSHOT_JS = """
+    (areas, attrNames) => {
+        function pointsFor(area) {
+            const nums = (area.getAttribute('coords') || '')
+                .split(/[\\s,]+/).filter(Boolean).map(Number);
+            const shape = (area.getAttribute('shape') || 'rect').toLowerCase();
+            if (!nums.length || nums.some(isNaN)) { return []; }
+            if (shape.startsWith('circ')) { return [[nums[0], nums[1]]]; }
+            if (shape.startsWith('poly')) {
+                const pts = [];
+                for (let i = 0; i + 1 < nums.length; i += 2) {
+                    pts.push([nums[i], nums[i + 1]]);
+                }
+                if (!pts.length) { return []; }
+                const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+                const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+                // centroid first, then vertices pulled towards it
+                return [[cx, cy]].concat(
+                    pts.map(p => [p[0] + (cx - p[0]) * 0.2, p[1] + (cy - p[1]) * 0.2])
+                );
+            }
+            if (nums.length >= 4) {
+                return [[(nums[0] + nums[2]) / 2, (nums[1] + nums[3]) / 2]];
+            }
+            return [];
+        }
+
+        function imageFor(area) {
+            const map = area.closest('map');
+            if (!map) { return null; }
+            const name = map.getAttribute('name') || map.id || '';
+            if (!name) { return null; }
+            return Array.from(document.querySelectorAll('img[usemap], input[usemap]'))
+                .find(img => (img.getAttribute('usemap') || '').replace(/^#/, '') === name)
+                || null;
+        }
+
+        return areas.map((area, index) => {
+            const attrs = {};
+            for (const n of attrNames) { attrs[n] = area.getAttribute(n) || ''; }
+            let point = null;
+            let verified = false;
+            const img = imageFor(area);
+            if (img) {
+                const r = img.getBoundingClientRect();
+                const bl = parseFloat(getComputedStyle(img).borderLeftWidth) || 0;
+                const bt = parseFloat(getComputedStyle(img).borderTopWidth) || 0;
+                for (const [px, py] of pointsFor(area)) {
+                    const x = r.left + bl + px;
+                    const y = r.top + bt + py;
+                    const hit = document.elementFromPoint(x, y);
+                    if (hit === area) { point = {x, y}; verified = true; break; }
+                    if (!point && hit === img) { point = {x, y}; }
+                }
+            }
+            return {
+                index,
+                href: area.getAttribute('href') || '',
+                onclick: area.getAttribute('onclick') || '',
+                attrs,
+                point,
+                verified,
+            };
+        });
+    }
+    """
+
+    def _snapshot_zone_areas(self, page):
+        try:
+            return page.locator("map area").evaluate_all(
+                self._ZONE_SNAPSHOT_JS,
+                self.ZONE_NAME_ATTRS,
+            ) or []
+        except Exception:
+            return []
+
+    def _zone_name_from_record(self, record):
+        """Zone name from an area snapshot (href / attrs / onclick)."""
+        href = record.get("href") or ""
+        onclick = record.get("onclick") or ""
+        attrs = record.get("attrs") or {}
 
         candidates = []
 
         # 1) href fragment เช่น #A1, #SB, #C
         if "#" in href:
-            candidates.append(
-                href.rsplit("#", 1)[-1]
-            )
+            candidates.append(href.rsplit("#", 1)[-1])
 
         # 2) data attributes / normal attributes
-        for attr in [
-            "data-zone",
-            "data-zone-name",
-            "data-zonecode",
-            "data-zone-code",
-            "title",
-            "alt",
-            "name",
-            "id",
-        ]:
-            try:
-                value = area.get_attribute(attr) or ""
-                if value:
-                    candidates.append(value)
-            except Exception:
-                pass
+        for attr in self.ZONE_NAME_ATTRS:
+            value = attrs.get(attr) or ""
+            if value:
+                candidates.append(value)
 
         # 3) onclick patterns:
-        # selectzone(this.href,event)
-        # selectzone('A1',...)
-        # selectzone("#SB",...)
+        # selectzone('A1',...) / selectzone("#SB",...)
         for pattern in [
             r"""selectzone\s*\(\s*['"]#?([^'"]+)['"]""",
             r"""zone\s*[:=]\s*['"]([^'"]+)['"]""",
         ]:
-            match = re.search(
-                pattern,
-                onclick,
-                flags=re.I,
-            )
+            match = re.search(pattern, onclick, flags=re.I)
             if match:
-                candidates.append(
-                    match.group(1)
-                )
+                candidates.append(match.group(1))
 
         for raw in candidates:
             name = self._normalize_zone_name(raw)
@@ -2991,14 +3047,23 @@ class ThaiTicketMajorBot:
 
         return ""
 
+    def _extract_zone_name_from_area(self, area):
+        """Compatibility wrapper for a single area locator."""
+        record = {
+            "href": area.get_attribute("href") or "",
+            "onclick": area.get_attribute("onclick") or "",
+            "attrs": {
+                attr: area.get_attribute(attr) or ""
+                for attr in self.ZONE_NAME_ATTRS
+            },
+        }
+        return self._zone_name_from_record(record)
+
     def read_zones(self, page):
         """
-        อ่าน Zone จาก Image Map แบบยืดหยุ่น
+        อ่าน Zone จาก Image Map แบบยืดหยุ่น ใน browser round-trip เดียว
 
-        เดิมอ่านเฉพาะ:
-            map area[onclick*="selectzone"] + href #ZONE
-
-        เวอร์ชันนี้รองรับ:
+        รองรับ:
             - onclick selectzone
             - href มี #ZONE
             - data-zone / data-zone-name
@@ -3009,37 +3074,29 @@ class ThaiTicketMajorBot:
             FF,HH,SB..SN,C..S
         โดยไม่ hard-code รายชื่อ.
         """
-        areas = page.locator("map area")
-
         zones = []
         seen = set()
 
-        for i in range(areas.count()):
-            area = areas.nth(i)
-
-            href = area.get_attribute("href") or ""
-            onclick = area.get_attribute("onclick") or ""
+        for record in self._snapshot_zone_areas(page):
+            href = record.get("href") or ""
+            onclick = record.get("onclick") or ""
+            attrs = record.get("attrs") or {}
 
             # Ignore unrelated image-map areas when there is
             # no indication that it represents a selectable zone.
             has_zone_hint = (
                 "selectzone" in onclick.lower()
                 or "#" in href
-                or bool(area.get_attribute("data-zone"))
-                or bool(area.get_attribute("data-zone-name"))
+                or bool(attrs.get("data-zone"))
+                or bool(attrs.get("data-zone-name"))
             )
 
             if not has_zone_hint:
                 continue
 
-            name = self._extract_zone_name_from_area(
-                area
-            )
+            name = self._zone_name_from_record(record)
 
-            if not name:
-                continue
-
-            if name in seen:
+            if not name or name in seen:
                 continue
 
             seen.add(name)
@@ -3048,7 +3105,7 @@ class ThaiTicketMajorBot:
                 {
                     "name": name,
                     "href": href,
-                    "index": i,
+                    "index": record.get("index"),
                 }
             )
 
@@ -3097,33 +3154,27 @@ class ThaiTicketMajorBot:
         return zones
 
     def handle_zone(self, page):
+        """
+        Select a zone by priority. If a zone does not open (sold out /
+        no seat map), try the next one instead of stopping the bot.
+
+        Returns True when a seat map is open, False after every
+        candidate failed once (run() retries with a new scan cycle).
+        """
         zones = self.read_zones(page)
 
         if not zones:
-            raise Exception(
-                "ไม่พบ Zone ใน Image Map"
-            )
+            raise Exception("ไม่พบ Zone ใน Image Map")
 
         available_names = [
-            self._normalize_zone_name(
-                zone["name"]
-            )
-            for zone in zones
+            self._normalize_zone_name(zone["name"]) for zone in zones
         ]
 
-        self.status(
-            "🗺️ Zones: "
-            + ", ".join(available_names)
-        )
+        self.status("🗺️ Zones: " + ", ".join(available_names))
 
-        candidates = self._zone_candidates(
-            zones
-        )
+        candidates = self._zone_candidates(zones)
 
-        if (
-            self.selection_mode == "ZONE"
-            and self.preferred_zones
-        ):
+        if self.selection_mode == "ZONE" and self.preferred_zones:
             normalized_priority = [
                 self._normalize_zone_name(z)
                 for z in self.preferred_zones
@@ -3131,79 +3182,95 @@ class ThaiTicketMajorBot:
             ]
 
             self.status(
-                "🎯 Zone Priority: "
-                + " → ".join(
-                    normalized_priority
-                )
+                "🎯 Zone Priority: " + " → ".join(normalized_priority)
             )
 
-            available_set = set(
-                available_names
-            )
+            available_set = set(available_names)
 
-            missing = [
-                z
-                for z in normalized_priority
-                if z not in available_set
-            ]
+            for zone_name in normalized_priority:
+                if zone_name not in available_set:
+                    self.status(f"⏭️ Zone {zone_name} ไม่มีในรอบนี้")
 
-            for zone_name in missing:
+        if not candidates:
+            raise Exception("ไม่มี Zone Candidate ตาม Priority ในรอบนี้")
+
+        for zone in candidates:
+            name = self._normalize_zone_name(zone["name"])
+
+            if name in self._attempted_zones:
+                continue
+
+            self.selected_zone = name
+            self._attempted_zones.add(name)
+
+            self.status(f"✅ เลือก Zone: {name}")
+
+            try:
+                self.select_zone(page, name)
+                return True
+
+            except Exception as ex:
+                if str(ex) == "BOT_STOPPED":
+                    raise
+
                 self.status(
-                    f"⏭️ Zone {zone_name} ไม่มีในรอบนี้"
+                    f"⚠️ Zone {name} เปิดไม่ได้ ({ex}) → ลอง Zone ถัดไป"
                 )
 
-        target = next(
-            (
-                zone
-                for zone in candidates
-                if self._normalize_zone_name(
-                    zone["name"]
-                )
-                not in self._attempted_zones
-            ),
-            None,
-        )
+                try:
+                    self._dismiss_seat_popup_if_present(page)
+                except Exception:
+                    pass
 
-        if target is None:
-            self.status(
-                "🔁 ลอง Zone ครบทุก Zone แล้ว → เริ่มวนหา Seat ใหม่"
-            )
-            self._attempted_zones.clear()
-            self._request_zone_switch = False
-            self._seat_failure_reason = ""
-            self._scan_cycle += 1
-            self.status(f"🔁 SCAN CYCLE #{self._scan_cycle}")
+                # Still need the zone map to try the next zone
+                try:
+                    if page.locator("map area").count() == 0:
+                        if not self.return_to_zone_map(page):
+                            raise Exception(
+                                "กลับ Zone Map ไม่สำเร็จ"
+                            )
+                except Exception as nav_ex:
+                    if str(nav_ex) == "BOT_STOPPED":
+                        raise
+                    raise Exception(
+                        f"Zone {name} เปิดไม่ได้ และ{nav_ex}"
+                    )
 
-            zones = self.read_zones(page)
-            if not zones:
-                raise Exception("ไม่พบ Zone หลังเริ่ม Scan Cycle ใหม่")
-
-            candidates = self._zone_candidates(zones)
-            target = next(iter(candidates), None)
-            if target is None:
-                raise Exception("ไม่มี Zone Candidate สำหรับ Scan Cycle ใหม่")
-
-        self.selected_zone = (
-            self._normalize_zone_name(
-                target["name"]
-            )
-        )
-
-        self._attempted_zones.add(
-            self.selected_zone
-        )
-
+        # Every candidate failed once: start a new scan cycle.
         self.status(
-            f"✅ เลือก Zone: "
-            f"{self.selected_zone}"
+            "🔁 ลอง Zone ครบทุก Zone แล้ว → เริ่มวนหา Seat ใหม่"
         )
+        self._attempted_zones.clear()
+        self._request_zone_switch = False
+        self._seat_failure_reason = ""
+        self._scan_cycle += 1
+        self.status(f"🔁 SCAN CYCLE #{self._scan_cycle}")
 
-        self.select_zone(
-            page,
-            self.selected_zone,
+        self._sleep_with_countdown(
+            1.0,
+            lambda left: (
+                f"🔁 ทุก Zone ยังไม่เปิด | Scan cycle #{self._scan_cycle}"
+            ),
         )
+        return False
 
-    def select_zone(self, page, zone_name):
+    ZONE_POPUP_SELECTORS = [
+        "#popup_alert",
+        ".fancybox-wrap",
+        ".fancybox-overlay",
+    ]
+
+    def _zone_popup_visible(self, page):
+        for selector in self.ZONE_POPUP_SELECTORS:
+            try:
+                loc = page.locator(selector).first
+                if loc.count() > 0 and loc.is_visible():
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def select_zone(self, page, zone_name, seat_wait_ms=None):
         """
         เลือก Zone แบบไม่ผูกกับชื่อรูปแบบ A1 เท่านั้น.
 
@@ -3212,188 +3279,160 @@ class ThaiTicketMajorBot:
             SB / SC / ... / SN
             FF / HH
             C / D / ... / S
+
+        1) Real mouse click on the zone's position in the map image
+           (Playwright cannot click <area> itself; that attempt used
+           to time out for 2.2 s on every zone).
+        2) Fallback: the page's own selectzone() for the same area.
         """
 
-        target = self._normalize_zone_name(
-            zone_name
-        )
+        target = self._normalize_zone_name(zone_name)
 
         if not target:
-            raise Exception(
-                "ชื่อ Zone ไม่ถูกต้อง"
-            )
+            raise Exception("ชื่อ Zone ไม่ถูกต้อง")
 
-        # Find target by parsing every <area>, rather than CSS
-        # href suffix matching. This handles lowercase / encoded /
-        # data-zone based layouts.
-        areas = page.locator("map area")
+        if seat_wait_ms is None:
+            seat_wait_ms = self.zone_seat_wait_ms
 
-        zone = None
-        zone_info = None
+        def find_record():
+            for record in self._snapshot_zone_areas(page):
+                if self._zone_name_from_record(record) == target:
+                    return record
+            return None
 
-        for i in range(areas.count()):
-            area = areas.nth(i)
+        record = find_record()
 
-            current = (
-                self._extract_zone_name_from_area(
-                    area
-                )
-            )
+        if record is None:
+            raise Exception(f"ไม่พบ Zone {target}")
 
-            if current == target:
-                zone = area
-                zone_info = {
-                    "index": i,
-                    "href":
-                        area.get_attribute(
-                            "href"
-                        )
-                        or "",
-                    "onclick":
-                        area.get_attribute(
-                            "onclick"
-                        )
-                        or "",
-                }
-                break
+        zone = page.locator("map area").nth(record["index"])
 
-        if zone is None:
-            raise Exception(
-                f"ไม่พบ Zone {target}"
-            )
+        # Bring the map image into view, then measure the point again.
+        point = record.get("point")
 
-        self.status(
-            f"👉 Click Zone {target}"
-        )
-
-        def wait_seat_map():
+        if point:
             try:
-                page.wait_for_selector(
-                    "#tableseats td[title][data-info]",
-                    timeout=8000,
+                zone.evaluate(
+                    """
+                    el => {
+                        const map = el.closest('map');
+                        const name = map && (map.getAttribute('name') || map.id);
+                        const img = name && Array.from(
+                            document.querySelectorAll('img[usemap], input[usemap]')
+                        ).find(i => (i.getAttribute('usemap') || '').replace(/^#/, '') === name);
+                        if (img) { img.scrollIntoView({block: 'nearest', inline: 'nearest'}); }
+                    }
+                    """
                 )
-
-                return (
-                    page.locator(
-                        "#tableseats td[title][data-info]"
-                    ).count()
-                    > 0
-                )
+                record = find_record() or record
+                point = record.get("point")
             except Exception:
-                return False
+                pass
+
+        self.status(f"👉 Click Zone {target}")
+
+        def wait_seat_map(timeout_ms):
+            """True = seat map, False = timeout. A site popup (zone
+            sold out / not available) ends the wait at once."""
+            end = time.time() + timeout_ms / 1000.0
+
+            while time.time() < end:
+                if self.should_stop():
+                    raise Exception("BOT_STOPPED")
+
+                try:
+                    if page.locator(
+                        "#tableseats td[title][data-info]"
+                    ).count() > 0:
+                        return True
+                except Exception:
+                    pass  # navigating to the seat page
+
+                if self._zone_popup_visible(page):
+                    raise Exception(f"Zone {target} ไม่ว่าง (popup)")
+
+                page.wait_for_timeout(60)
+
+            return False
+
+        mouse_clicked = False
 
         # --------------------------------------------------
-        # 1) Normal Playwright Click
+        # 1) Real mouse click at the zone position
         # --------------------------------------------------
-        try:
-            zone.click(
-                timeout=2200
-            )
+        if point:
+            try:
+                page.mouse.click(point["x"], point["y"])
+                mouse_clicked = True
 
-            if wait_seat_map():
-                self.status(
-                    "✅ Seat Map พร้อม"
-                )
-                return True
+                if wait_seat_map(seat_wait_ms):
+                    self.status("✅ Seat Map พร้อม")
+                    return True
 
-        except Exception:
-            self.status(
-                "⚠️ Normal Click Zone ไม่ผ่าน"
-            )
+            except Exception as ex:
+                if "(popup)" in str(ex) or str(ex) == "BOT_STOPPED":
+                    raise
+                self.status(f"⚠️ Mouse click Zone: {ex}")
 
         # --------------------------------------------------
-        # 2) Call page selectzone() using actual area.href
+        # 2) Page's own selectzone() using the area's href
+        #    (only waits briefly if the real click already hit
+        #    the zone: then the zone itself is not opening)
         # --------------------------------------------------
+        if self.should_stop():
+            raise Exception("BOT_STOPPED")
+
         try:
             result = zone.evaluate(
                 """
                 el => {
                     try {
-                        if (
-                            typeof window.selectzone
-                            === "function"
-                        ) {
-                            const ev =
-                                new MouseEvent(
-                                    "click",
-                                    {
-                                        bubbles: true,
-                                        cancelable: true,
-                                        view: window
-                                    }
-                                );
-
-                            window.selectzone(
-                                el.href,
-                                ev
-                            );
-
-                            return {
-                                ok: true,
-                                method:
-                                    "selectzone",
-                                href: el.href
-                            };
+                        if (typeof window.selectzone === "function") {
+                            const ev = new MouseEvent("click", {
+                                bubbles: true, cancelable: true, view: window
+                            });
+                            window.selectzone(el.href, ev);
+                            return {ok: true, method: "selectzone"};
                         }
-
                         el.click();
-
-                        return {
-                            ok: true,
-                            method:
-                                "element.click",
-                            href: el.href
-                        };
-
+                        return {ok: true, method: "element.click"};
                     } catch (error) {
-                        return {
-                            ok: false,
-                            error:
-                                String(error)
-                        };
+                        return {ok: false, error: String(error)};
                     }
                 }
-                """
+                """,
+                timeout=3000,
             )
 
-            self.status(
-                f"   Zone JS result={result}"
+            self.status(f"   Zone JS result={result}")
+
+            fallback_wait = (
+                2500
+                if mouse_clicked and record.get("verified")
+                else seat_wait_ms
             )
 
-            if wait_seat_map():
-                self.status(
-                    "✅ Seat Map พร้อม"
-                )
+            if wait_seat_map(fallback_wait):
+                self.status("✅ Seat Map พร้อม")
                 return True
 
         except Exception as ex:
-            self.status(
-                f"⚠️ Zone JS Error: {ex}"
-            )
+            if "(popup)" in str(ex) or str(ex) == "BOT_STOPPED":
+                raise
 
-        # --------------------------------------------------
-        # 3) Last fallback: dispatch actual click event
-        # --------------------------------------------------
-        try:
-            zone.dispatch_event(
-                "click"
-            )
-
-            if wait_seat_map():
-                self.status(
-                    "✅ Seat Map พร้อม"
-                )
+            # selectzone() may navigate immediately
+            if wait_seat_map(seat_wait_ms):
+                self.status("✅ Seat Map พร้อม")
                 return True
-        except Exception:
-            pass
+
+            self.status(f"⚠️ Zone JS Error: {ex}")
 
         self.status(
-            f"🔎 Zone info: {zone_info}"
+            f"🔎 Zone info: index={record.get('index')} "
+            f"href={record.get('href')} point={point}"
         )
 
-        raise Exception(
-            f"เลือก Zone {target} ไม่สำเร็จ"
-        )
+        raise Exception(f"เลือก Zone {target} ไม่สำเร็จ")
 
     # ==========================================================
     # SEAT POPUP / ZONE FAILOVER
